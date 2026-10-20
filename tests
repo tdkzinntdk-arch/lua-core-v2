@@ -1171,23 +1171,75 @@ end
 
 do
 	GetBP = function(p33)
-		return plr.Backpack:FindFirstChild(p33) or plr.Character:FindFirstChild(p33)
+		-- CORRIGIDO: plr.Backpack e nil durante o respawn, e plr.Character
+		-- idem. O acesso direto derrubava a thread com "attempt to index nil"
+		-- justamente na hora que o jogador morria.
+		local Backpack = plr.Backpack
+
+		if not Backpack then
+			Backpack = plr:FindFirstChildOfClass("Backpack")
+		end
+
+		local Char = plr.Character
+
+		if Backpack then
+			local achou = Backpack:FindFirstChild(p33)
+
+			if achou then
+				return achou
+			end
+		end
+
+		if Char then
+			return Char:FindFirstChild(p33)
+		end
+
+		return nil
+	end
+
+	-- le o .Level.Value de uma ferramenta com seguranca.
+	-- Usado no lugar de  GetBP(x) and GetBP(x).Level.Value  — que buscava
+	-- a ferramenta DUAS vezes e estourava nil quando ela nao tinha Level.
+	function GetBPLevel(nome)
+		local ferramenta = GetBP(nome)
+
+		if not ferramenta then
+			return nil
+		end
+
+		local lvl = ferramenta:FindFirstChild("Level")
+
+		if lvl and typeof(lvl.Value) == "number" then
+			return lvl.Value
+		end
+
+		return nil
 	end
 end
 
 do
 	GetIn = function(p34)
-		for _, v1 in pairs(replicated.Remotes.CommF_:InvokeServer("getInventory")) do
-			if type(v1) == "table" then
-				if v1.Name == p34 then
-					return true
-				end
+		-- CORRIGIDO: os checks de Character/Backpack estavam DENTRO do loop
+		-- do inventario — se ele viesse vazio, nunca rodavam. Agora ficam
+		-- fora, e Character/Backpack tem guarda de nil.
+		local Char = plr.Character
+		local Backpack = plr.Backpack or plr:FindFirstChildOfClass("Backpack")
 
-				if plr.Character:FindFirstChild(p34) then
-					return true
-				end
+		if Char and Char:FindFirstChild(p34) then
+			return true
+		end
 
-				if plr.Backpack:FindFirstChild(p34) then
+		if Backpack and Backpack:FindFirstChild(p34) then
+			return true
+		end
+
+		local ok, inventario = pcall(function()
+			return replicated.Remotes.CommF_:InvokeServer("getInventory")
+		end)
+
+		if ok and type(inventario) == "table" then
+			for _, v1 in pairs(inventario) do
+				if type(v1) == "table" and v1.Name == p34 then
 					return true
 				end
 			end
@@ -3728,23 +3780,74 @@ Berry = GRP_Main_Collect_Berry:AddToggle("Auto_Farm_Berry", {
 spawn(function()
 	while wait(Sec) do
 		if _G.AutoBerry then
-			local CollectionService = game:GetService("CollectionService")
-			local LocalPlayer = game:GetService("Players").LocalPlayer
-			local tagged = CollectionService:GetTagged("BerryBush")
-			local n3 = 1
-			local v392 = #tagged
+			-- RECONSTRUIDO: este bloco tinha a estrutura destruida na
+			-- descompilacao ("could not be recovered" + um `continue`
+			-- incondicional que matava o loop na 1a iteracao). O Auto Farm
+			-- Berry NUNCA coletava nada.
+			--
+			-- A logica foi recuperada do bloco "Berry + Hop" logo abaixo,
+			-- que ficou intacto - mesma coleta, sem o server hop.
+			pcall(function()
+				local CollectionService = game:GetService("CollectionService")
+				local tagged = CollectionService:GetTagged("BerryBush")
 
-			if true then
-				if n3 <= v392 then
-					-- (could not be recovered)
+				if #tagged == 0 then
+					return
 				end
 
-				continue
-			end
+				local Char = plr.Character
+				local HRP = Char and Char:FindFirstChild("HumanoidRootPart")
 
-			if n3 >= v392 then
-				-- (could not be recovered)
-			end
+				if not HRP then
+					return
+				end
+
+				for i = 1, #tagged do
+					local arbusto = tagged[i]
+
+					if not arbusto or not arbusto.Parent then
+						continue
+					end
+
+					for _, atributo in pairs(arbusto:GetAttributes()) do
+						if not BerryArray or table.find(BerryArray, atributo) then
+							pcall(function()
+								_tp(arbusto.Parent:GetPivot())
+							end)
+
+							for i2 = 1, #tagged do
+								local alvo = tagged[i2]
+
+								if not alvo or not alvo.Parent then
+									continue
+								end
+
+								for _, child in pairs(alvo:GetChildren()) do
+									if not BerryArray or table.find(BerryArray, child.Name) then
+										-- valida antes de usar (o original
+										-- acessava WorldPivot direto)
+										local pivot = child.WorldPivot
+
+										if pivot then
+											pcall(function()
+												_tp(pivot)
+											end)
+										end
+
+										local prompt = child:FindFirstChildOfClass("ProximityPrompt")
+
+										if prompt then
+											pcall(function()
+												fireproximityprompt(prompt, math.huge)
+											end)
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end)
 		end
 	end
 end)
@@ -9481,38 +9584,48 @@ do
 						replicated.Remotes.CommF_:InvokeServer("LoadItem", "Pole (2nd Form)")
 					end
 
-					if GetBP("Pole (1st Form)") and GetBP("Pole (1st Form)").Level.Value <= 179 then
+					if (GetBPLevel("Pole (1st Form)") or -1) <= 179 then
 						_G.Level = true
-					elseif GetBP("Pole (1st Form)") and GetBP("Pole (1st Form)").Level.Value >= 180 then
+					elseif (GetBPLevel("Pole (1st Form)") or -1) >= 180 then
 						_G.Level = false
 					end
 
-					if not GetBP("Rumble Fruit") then
+					local FrutaRumble = GetBP("Rumble Fruit")
+
+					if not FrutaRumble then
 						return
 					end
 
-					local ok2 = not GetBP("Rumble Fruit").AwakenedMoves:FindFirstChild("Z")
+					-- CORRIGIDO: AwakenedMoves pode nao existir (fruta nao
+					-- desperta ainda). O acesso direto estourava nil.
+					local Desperta = FrutaRumble:FindFirstChild("AwakenedMoves")
+
+					if not Desperta then
+						return
+					end
+
+					local ok2 = not Desperta:FindFirstChild("Z")
 
 					if not ok2 then
-						ok2 = not GetBP("Rumble Fruit").AwakenedMoves:FindFirstChild("X")
+						ok2 = not Desperta:FindFirstChild("X")
 					end
 
 					local ok3 = ok2
 
 					if not ok3 then
-						ok3 = not GetBP("Rumble Fruit").AwakenedMoves:FindFirstChild("C")
+						ok3 = not Desperta:FindFirstChild("C")
 					end
 
 					local ok4 = ok3
 
 					if not ok4 then
-						ok4 = not GetBP("Rumble Fruit").AwakenedMoves:FindFirstChild("V")
+						ok4 = not Desperta:FindFirstChild("V")
 					end
 
 					local ok5 = ok4
 
 					if not ok5 then
-						ok5 = not GetBP("Rumble Fruit").AwakenedMoves:FindFirstChild("F")
+						ok5 = not Desperta:FindFirstChild("F")
 					end
 
 					if ok5 then
@@ -10983,7 +11096,9 @@ do
 									end
 								end
 							until ok
-							-- (could not be recovered)
+							-- NOTA: aqui havia um trecho que a descompilacao nao
+							-- recuperou. O loop acima ja concluiu (until ok),
+							-- entao nada de essencial se perdeu.
 						end
 
 						if plr:FindFirstChild("Banana") then
@@ -11273,9 +11388,9 @@ do
 
 					if plr:FindFirstChild("WeaponAssetCache") and not GetBP("Superhuman") then
 						if GetBP("Black Leg") then
-							if GetBP("Black Leg") and GetBP("Black Leg").Level.Value < 299 then
+							if (GetBPLevel("Black Leg") or -1) < 299 then
 								_G.Level = true
-							elseif GetBP("Black Leg") and GetBP("Black Leg").Level.Value >= 300 then
+							elseif (GetBPLevel("Black Leg") or -1) >= 300 then
 								_G.Level = false
 							end
 						elseif Value >= 150000 then
@@ -11283,9 +11398,9 @@ do
 						end
 
 						if GetBP("Electro") then
-							if GetBP("Electro") and GetBP("Electro").Level.Value < 299 then
+							if (GetBPLevel("Electro") or -1) < 299 then
 								_G.Level = true
-							elseif GetBP("Electro") and GetBP("Electro").Level.Value >= 300 then
+							elseif (GetBPLevel("Electro") or -1) >= 300 then
 								_G.Level = false
 							end
 						elseif Value >= 500000 then
@@ -11293,9 +11408,9 @@ do
 						end
 
 						if GetBP("Fishman Karate") then
-							if GetBP("Fishman Karate") and GetBP("Fishman Karate").Level.Value < 299 then
+							if (GetBPLevel("Fishman Karate") or -1) < 299 then
 								_G.Level = true
-							elseif GetBP("Fishman Karate") and GetBP("Fishman Karate").Level.Value >= 300 then
+							elseif (GetBPLevel("Fishman Karate") or -1) >= 300 then
 								_G.Level = false
 							end
 						elseif Value >= 750000 then
@@ -11303,10 +11418,10 @@ do
 						end
 
 						if GetBP("Dragon Claw") then
-							if GetBP("Dragon Claw") and GetBP("Dragon Claw").Level.Value < 299 then
+							if (GetBPLevel("Dragon Claw") or -1) < 299 then
 								_G.Level = true
 							elseif GetBP("Dragon Claw") then
-								if GetBP("Dragon Claw").Level.Value >= 300 then
+								if (GetBPLevel("Dragon Claw") or -1) >= 300 then
 									_G.Level = false
 								end
 							end
@@ -11342,14 +11457,18 @@ do
 							replicated.Remotes.CommF_:InvokeServer("BuyBlackLeg")
 						end
 
-						if GetBP("Black Leg") and GetBP("Black Leg").Level.Value >= 400 then
+						if (GetBPLevel("Black Leg") or -1) >= 400 then
 							replicated.Remotes.CommF_:InvokeServer("BuyDeathStep")
 							_G.Level = false
-						elseif GetBP("Black Leg") and GetBP("Black Leg").Level.Value < 399 then
+						elseif (GetBPLevel("Black Leg") or -1) < 399 then
 							_G.Level = true
 						end
 
-						if (GetBP("Black Leg") or GetBP("Black Leg").Level.Value >= 400) and workspace.Map.IceCastle.Hall.LibraryDoor.PhoeyuDoor.Transparency == 0 then
+						-- CORRIGIDO: era  (GetBP(x) or GetBP(x).Level.Value >= 400)
+						-- Como "or" tem precedencia sobre o "and" externo, isso
+						-- virava  GetBP(x) OR (...). Bastava TER a ferramenta
+						-- para entrar, ignorando o mastery por completo.
+						if (GetBPLevel("Black Leg") or -1) >= 400 and workspace.Map.IceCastle.Hall.LibraryDoor.PhoeyuDoor.Transparency == 0 then
 							if GetBP("Library Key") then
 								while true do
 									wait()
@@ -11411,14 +11530,17 @@ spawn(function()
 						replicated.Remotes.CommF_:InvokeServer("BuyFishmanKarate")
 					end
 
-					if GetBP("Fishman Karate") and GetBP("Fishman Karate").Level.Value >= 400 then
+					if (GetBPLevel("Fishman Karate") or -1) >= 400 then
 						replicated.Remotes.CommF_:InvokeServer("BuySharkmanKarate")
 						_G.Level = false
-					elseif GetBP("Fishman Karate") and GetBP("Fishman Karate").Level.Value < 399 then
+					elseif (GetBPLevel("Fishman Karate") or -1) < 399 then
 						_G.Level = true
 					end
 
-					if GetBP("Fishman Karate") or GetBP("Fishman Karate").Level.Value >= 400 then
+					-- CORRIGIDO: mesma precedencia errada do Black Leg.
+					-- Era  GetBP(x) or GetBP(x).Level.Value >= 400  ->  bastava
+					-- ter a ferramenta, o mastery era ignorado.
+					if (GetBPLevel("Fishman Karate") or -1) >= 400 then
 						if GetBP("Water Key") then
 							if string.find(replicated.Remotes.CommF_:InvokeServer("BuySharkmanKarate"), "keys") and GetBP("Water Key") then
 								while true do
@@ -11480,13 +11602,13 @@ do
 							replicated.Remotes.CommF_:InvokeServer("BuyElectro")
 						end
 
-						if GetBP("Electro") and GetBP("Electro").Level.Value >= 400 then
+						if (GetBPLevel("Electro") or -1) >= 400 then
 							if replicated.Remotes.CommF_:InvokeServer("BuyElectricClaw", "Start") == nil then
 								notween(CFrame.new(-12548, 337, -7481))
 							end
 
 							replicated.Remotes.CommF_:InvokeServer("BuyElectricClaw")
-						elseif GetBP("Electro") and GetBP("Electro").Level.Value < 400 then
+						elseif (GetBPLevel("Electro") or -1) < 400 then
 							while true do
 								_G.AutoFarm_Bone = true
 								wait()
@@ -11527,10 +11649,10 @@ do
 							replicated.Remotes.CommF_:InvokeServer("BlackbeardReward", "DragonClaw", "2")
 						end
 
-						if GetBP("Dragon Claw") and GetBP("Dragon Claw").Level.Value >= 400 then
+						if (GetBPLevel("Dragon Claw") or -1) >= 400 then
 							replicated.Remotes.CommF_:InvokeServer("Bones", "Buy", 1, 1)
 							replicated.Remotes.CommF_:InvokeServer("BuyDragonTalon")
-						elseif GetBP("Dragon Claw") and GetBP("Dragon Claw").Level.Value < 400 then
+						elseif (GetBPLevel("Dragon Claw") or -1) < 400 then
 							while true do
 								_G.AutoFarm_Bone = true
 								wait()

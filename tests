@@ -3093,6 +3093,24 @@ Name2Name = {
 	["Dark Step"] = "BlackLeg",
 	["Dragon Breath"] = "DragonClaw",
 }
+
+-- Nomes reais das ferramentas no inventario. As chaves internas usadas pelo
+-- kaitun nao coincidem sempre com o nome exibido pelo jogo.
+local MeleeToolNames = {
+	BlackLeg = "Dark Step",
+	Electro = "Electric",
+	FishmanKarate = "Water Kung Fu",
+	DragonClaw = "Dragon Breath",
+	Superhuman = "Superhuman",
+	DeathStep = "Death Step",
+	SharkmanKarate = "Sharkman Karate",
+	ElectricClaw = "Electric Claw",
+	DragonTalon = "Dragon Talon",
+	Godhuman = "Godhuman",
+}
+local function GetMeleeToolName(key)
+	return MeleeToolNames[key] or key:gsub("(%l)(%u)", "%1 %2")
+end
 local lastMeleeDataCheck = 0
 local function CheckMeleeMastery()
 	local now = tick()
@@ -3224,7 +3242,7 @@ local function MeleeKaitunLogic()
 		CheckMeleeMastery()
 	end
 	for _, v in {"BlackLeg", "Electro", "FishmanKarate"} do
-		local realName = v:gsub("(%l)(%u)", "%1 %2")
+		local realName = GetMeleeToolName(v)
 
 			if (MeleeData[v] or 0) < 400 then
             LogChange("melee_progress", "melee: " .. string.lower(realName) .. " " .. tostring(MeleeData[v] or 0) .. "/400")
@@ -3237,18 +3255,32 @@ local function MeleeKaitunLogic()
 			if not HasItem(realName) then
                 LogChange("melee_action", "melee: getting " .. string.lower(realName))
 				if not TweenToMeleeBuyer(v) then
-					return
+					SetStatus("melee | buyer position unavailable: " .. realName)
+					return true
 				end
+				-- Enquanto o fluxo viaja/compra o estilo, nao deixe FarmLevelLogic
+				-- tomar o controle do movimento no mesmo ciclo e mandar o player
+				-- de volta para a quest (ex.: Cursed Ship -> NPC -> Cursed Ship).
 				task.wait(0.5)
-				CommF_:InvokeServer("Buy" .. v)
+				local ok, result = pcall(function()
+					return CommF_:InvokeServer("Buy" .. v)
+				end)
+				if not ok then
+					LogChange("melee_buy_error", "melee: buy request failed for " .. realName)
+				else
+					LogChange("melee_buy_result", "melee: buy request sent for " .. realName)
+				end
+				return true
 			end
+			-- Se o estilo ja esta no inventario, deixe a rotina de farm normal
+			-- continuar; nao volte ao NPC em cada iteracao.
 			return
 		end
 	end
 
 	if not World.Sea1() then
 		for _, v in {"DragonClaw", "Superhuman", "DeathStep", "SharkmanKarate"} do
-			local realName = v:gsub("(%l)(%u)", "%1 %2")
+			local realName = GetMeleeToolName(v)
 			if (MeleeData[v] or 0) < 400 then
 				local hasEnoughEco = (
 					(MeleePrices[v].Price.Beli == nil) or (LocalPlayer.Data.Beli.Value >= MeleePrices[v].Price.Beli)
@@ -3291,7 +3323,7 @@ local function MeleeKaitunLogic()
 			end
 		end
 		for _, v in {"ElectricClaw", "DragonTalon", "Godhuman"} do
-			local realName = v:gsub("(%l)(%u)", "%1 %2")
+			local realName = GetMeleeToolName(v)
 			if (MeleeData[v] or 0) < 400 then
 				local hasEnoughEco = (
 					(MeleePrices[v].Price.Beli == nil) or (LocalPlayer.Data.Beli.Value >= MeleePrices[v].Price.Beli)

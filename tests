@@ -628,8 +628,12 @@ BringEnemy = function(p24)
 	end
 
 	pcall(function()
-		if sethiddenproperty then
-			sethiddenproperty(plr, "SimulationRadius", math.huge)
+		-- CORRIGIDO (Zyon): era `if sethiddenproperty then` sem checar tipo e
+		-- sem pcall — se o executor expusesse um global nao-funcao com esse
+		-- nome, isso estourava. Os outros dois sitios (L13822, L27700) ja
+		-- usavam a forma correta; este era o unico que sobrou do original.
+		if type(sethiddenproperty) == "function" then
+			pcall(sethiddenproperty, plr, "SimulationRadius", math.huge)
 		end
 
 		local Position = p24.HumanoidRootPart.Position
@@ -1554,7 +1558,11 @@ do
 					if Part and Part.Parent == workspace then
 						local PrimaryPart = LocalPlayer.Character and LocalPlayer.Character.PrimaryPart
 
-						if PrimaryPart and (PrimaryPart.Position - Part.Position).Magnitude <= 200 then
+						-- Limite configuravel (padrao 200, igual ao original).
+						-- Ver o grupo "Tween / Movement" na aba Settings.
+						local Limite = _G.TweenSnapDist or 200
+
+						if PrimaryPart and (PrimaryPart.Position - Part.Position).Magnitude <= Limite then
 							PrimaryPart.CFrame = CFrame.new(Part.Position)
 						else
 							Part.CFrame = PrimaryPart.CFrame
@@ -2030,6 +2038,19 @@ do
 				local HumanoidRootPart2 = plr.Character.HumanoidRootPart
 
 				if math.abs(cFrame.Position.Y - HumanoidRootPart2.CFrame.Y) > 1000 then
+					-- CORRIGIDO (Zyon): este `repeat` nao tinha timeout nem
+					-- limite de invocacoes — era um HANG + spam de remote.
+					--
+					-- O corpo teleporta SEMPRE para `cFrame2` (ponto fixo).
+					-- Se o jogador ja estiver nesse ponto, `getdis(cFrame2) < 10`
+					-- fica verdadeiro para sempre, o teleporte nao muda nada, e
+					-- `getdis(cFrame3) < 2000` (que compara com o DESTINO) nunca
+					-- e satisfeito -> laco infinito invocando
+					-- "AskKilledTikiBoss"/"TravelToSubmergedIsland" a cada frame.
+					-- Isso trava a thread e satura o remote (risco de kick).
+					local LimiteTentativas = 20
+					local tentativas = 0
+
 					repeat
 						task.wait()
 						old_tp(cFrame2)
@@ -2037,11 +2058,40 @@ do
 						if getdis(cFrame2) < 10 then
 							local Net = ReplicatedStorage.Modules.Net
 
-							Net["RF/SubmarineWorkerSpeak"]:InvokeServer("AskKilledTikiBoss")
+							pcall(function()
+								Net["RF/SubmarineWorkerSpeak"]:InvokeServer("AskKilledTikiBoss")
+							end)
 							task.wait(0.5)
-							Net["RF/SubmarineWorkerSpeak"]:InvokeServer("TravelToSubmergedIsland")
+							pcall(function()
+								Net["RF/SubmarineWorkerSpeak"]:InvokeServer("TravelToSubmergedIsland")
+							end)
 						end
-					until getdis(cFrame3.Position) < 2000
+
+						tentativas = tentativas + 1
+					until getdis(cFrame3.Position) < 2000 or tentativas >= LimiteTentativas
+
+					-- se desistimos, avisa uma vez e nao insiste
+					if tentativas >= LimiteTentativas and getdis(cFrame3.Position) >= 2000 then
+						if not getgenv().Nana_Submerged_Aviso then
+							getgenv().Nana_Submerged_Aviso = true
+
+							task.spawn(function()
+								pcall(function()
+									lib:Notify({
+										Title = "Teleporte",
+										Description = "Nao foi possivel entrar em Submerged Island. Movimento cancelado.",
+										Icon = "rbxassetid://5009915795",
+										Duration = 5
+									})
+								end)
+
+								task.wait(30)
+								getgenv().Nana_Submerged_Aviso = false
+							end)
+						end
+
+						return
+					end
 
 					task.wait(0.6)
 					pcall(function()
@@ -2054,10 +2104,29 @@ do
 		end
 
 		local Magnitude = (cFrame3.Position - HumanoidRootPart.Position).Magnitude
-		local tweenInfo = TweenInfo.new(Magnitude / (Magnitude <= 15 and (getgenv().TweenSpeedNear or 180) or getgenv().TweenSpeedFar or 150), Enum.EasingStyle.Linear)
+		local tweenInfo = TweenInfo.new(Magnitude / (Magnitude <= 15 and (getgenv().TweenSpeedNear or 180) or (getgenv().TweenSpeedFar or 150)), Enum.EasingStyle.Linear)
 		local tween = game:GetService("TweenService"):Create(Part, tweenInfo, {
 			CFrame = CFrame.new(cFrame3.Position)
 		})
+
+		-- CORRIGIDO (Zyon): guarda de REENTRANCIA por geracao.
+		--
+		-- O _tp tweena um Part UNICO e compartilhado (L1496). Duas chamadas
+		-- concorrentes criam dois tweens no MESMO Part/CFrame, e o
+		-- TweenService cancela o primeiro em silencio. O watcher do
+		-- primeiro entao via PlaybackState != Playing e seguia o caminho de
+		-- "cancelar e cair no chao" — derrubando o jogador no meio do
+		-- caminho, mesmo com o segundo tween indo para outro destino.
+		--
+		-- _tp e chamado ~500 vezes no arquivo, varias dentro de `while true`
+		-- (ex: L13815-13831), entao a colisao era frequente.
+		--
+		-- Solucao: cada chamada ganha um numero. So a MAIS RECENTE tem
+		-- permissao de cancelar o proprio tween. Chamadas antigas saem sem
+		-- tocar em nada.
+		getgenv().TweenGeracao = (getgenv().TweenGeracao or 0) + 1
+
+		local MinhaGeracao = getgenv().TweenGeracao
 
 		if plr.Character.Humanoid.Sit == true then
 			Part.CFrame = CFrame.new(Part.Position.X, cFrame3.Y, Part.Position.Z)
@@ -2066,6 +2135,11 @@ do
 		tween:Play()
 		task.spawn(function()
 			while tween.PlaybackState == Enum.PlaybackState.Playing do
+				-- se uma chamada mais nova assumiu, esta aqui nao manda mais
+				if getgenv().TweenGeracao ~= MinhaGeracao then
+					break
+				end
+
 				if shouldTween then
 					task.wait(0.1)
 				else
@@ -2341,7 +2415,51 @@ TeleportToTarget = function(p55)
 	task.wait(0.1)
 end
 notween = function(p56)
-	plr.Character.HumanoidRootPart.CFrame = p56
+	-- CORRIGIDO (Zyon): duas falhas.
+	--
+	-- 1. Sem guarda de nil: `plr.Character.HumanoidRootPart` estoura se o
+	--    personagem estiver morto/carregando. O _tp tem essa guarda
+	--    (L1977); o notween nao tinha, apesar de 17 chamadas no arquivo.
+	--
+	-- 2. O movimento era DESFEITO no frame seguinte. O loop de follow
+	--    (L1547-1588) puxa o personagem de volta para o Part
+	--    compartilhado quando a distancia passa do limite — e o notween
+	--    nunca movia o Part. Resultado: teleporte instantaneo seguido de
+	--    rubberband de volta para a posicao antiga.
+	--
+	-- Solucao: move o personagem E reposiciona o Part no mesmo lugar, para
+	-- o loop de follow nao ter nada a desfazer.
+	local Char = plr.Character
+	local HRP = Char and Char:FindFirstChild("HumanoidRootPart")
+
+	if not HRP then
+		return
+	end
+
+	local Destino
+
+	if typeof(p56) == "Vector3" then
+		Destino = CFrame.new(p56)
+	elseif typeof(p56) == "CFrame" then
+		Destino = p56
+	else
+		Destino = p56 and p56.CFrame
+	end
+
+	if not Destino then
+		return
+	end
+
+	pcall(function()
+		HRP.CFrame = Destino
+	end)
+
+	-- impede que o loop de follow arraste o jogador de volta
+	pcall(function()
+		if Part and Part.Parent == workspace then
+			Part.CFrame = Destino
+		end
+	end)
 end
 
 do
@@ -3866,14 +3984,21 @@ do
 					end)
 				end
 
-				LocalPlayer.CharacterAdded:Connect(function()
-					v377()
-					task.wait(0.5)
+				-- CORRIGIDO (Zyon): esta conexao era criada dentro do Callback
+				-- do toggle, entao CADA VEZ que o usuario ligava o
+				-- "Auto Chest Bypass" uma nova CharacterAdded era conectada
+				-- e nunca desconectada. Ligar/desligar 20 vezes = 20 handlers
+				-- disparando a cada respawn (vazamento de conexao).
+				if not _G.ChestBP_Conn then
+					_G.ChestBP_Conn = LocalPlayer.CharacterAdded:Connect(function()
+						v377()
+						task.wait(0.5)
 
-					if _G.AutoChestBP then
-						v385()
-					end
-				end)
+						if _G.AutoChestBP then
+							v385()
+						end
+					end)
+				end
 				v385()
 			end
 		end
@@ -7215,6 +7340,77 @@ do
 end
 
 -- ════════════════════════════════════════════════════════════════════════
+--  TWEEN / MOVIMENTO  (UI)
+--  Adicionado por Zyon.
+--
+--  Contexto da auditoria: o motor de movimento prende o personagem a um
+--  Part invisivel tweenado (L1496), e um loop separado (L1557) copia a
+--  posicao do Part para o personagem. Esse loop tem esta forma:
+--
+--      if (PrimaryPart.Position - Part.Position).Magnitude <= 200 then
+--          PrimaryPart.CFrame = CFrame.new(Part.Position)   -- segue
+--      else
+--          Part.CFrame = PrimaryPart.CFrame                 -- volta o Part
+--      end
+--
+--  O `else` protege contra o personagem "fugir" do Part (o que o servidor
+--  faria de qualquer forma), mas com limite fixo de 200 studs ele dispara
+--  durante tweens rapidos e travadas de frame - e nesse momento o Part
+--  volta para o jogador e o movimento reinicia. É a causa do "anda e
+--  volta" em teleportes longos.
+--
+--  Este bloco NAO reescreve o motor (o mesmo padrao existe no GB_HUB
+--  L1269, entao mexer nele quebraria compatibilidade). Apenas expoe o
+--  limiar e as velocidades, que antes eram numeros fixos no codigo.
+-- ════════════════════════════════════════════════════════════════════════
+do
+	local GRP_TW = t15.Settings:AddLeftGroupbox("Tween / Movement")
+
+	-- limites de aderencia: quanto o personagem pode ficar atras do Part
+	-- antes de o Part ser puxado de volta. Maior = tweens longos
+	-- completam, mas o personagem pode "esticar" visualmente.
+	_G.TweenSnapDist = 200
+
+	-- velocidades (studs/s). Antes eram fixas em 180/150 e lidas de
+	-- getgenv() sem nunca serem definidas - ou seja, nao havia controle.
+	getgenv().TweenSpeedNear = 180
+	getgenv().TweenSpeedFar = 150
+
+	GRP_TW:AddSlider({
+		Text = "Tween Speed (perto, <=15 studs)",
+		Default = 180,
+		Min = 50,
+		Max = 500,
+		Rounding = 0,
+		Callback = function(valor)
+			getgenv().TweenSpeedNear = valor
+		end
+	})
+
+	GRP_TW:AddSlider({
+		Text = "Tween Speed (longe)",
+		Default = 150,
+		Min = 50,
+		Max = 500,
+		Rounding = 0,
+		Callback = function(valor)
+			getgenv().TweenSpeedFar = valor
+		end
+	})
+
+	GRP_TW:AddSlider({
+		Text = "Tween Snap Distance",
+		Default = 200,
+		Min = 50,
+		Max = 1000,
+		Rounding = 0,
+		Callback = function(valor)
+			_G.TweenSnapDist = valor
+		end
+	})
+end
+
+-- ════════════════════════════════════════════════════════════════════════
 --  CPS CONTROL + ULTIMATE ATTACK  (UI)
 --  Adicionado por Zyon.
 --
@@ -7255,13 +7451,60 @@ do
 end
 
 do
+	-- CORRIGIDO (Zyon): o Bring Mobs aplicava um BodyVelocity congelado
+	-- (Velocity = 0) em cada inimigo num raio de 3000 studs (L645-651) —
+	-- e NUNCA removia. Consequencias reais:
+	--
+	--   1. Desligar o Bring Mobs deixava todos os inimigos do mapa
+	--      congelados para sempre (Velocity travada em 0).
+	--   2. Quando o Roblox reusa o Model de um inimigo que respawna, ele
+	--      JA NASCIA congelado, porque o BodyVelocity ia junto.
+	--
+	-- Isso degradava o jogo de forma permanente e progressiva: quanto
+	-- mais tempo com o hub ligado, mais inimigos travados.
+	--
+	-- A limpeza roda ao DESLIGAR o toggle e tambem periodicamente
+	-- enquanto ele estiver desligado, para pegar inimigos que
+	-- respawnaram depois.
+	function LimparBodyVelocityInimigos()
+		local ok = pcall(function()
+			for _, child in ipairs(workspace.Enemies:GetChildren()) do
+				local corpo = child:FindFirstChild("BodyVelocity")
+
+				-- so remove o NOSSO: MaxForce gigante e velocidade zero
+				if corpo and corpo:IsA("BodyVelocity") and corpo.Velocity.Magnitude == 0 then
+					corpo:Destroy()
+				end
+			end
+		end)
+
+		return ok
+	end
+
 	Bringmob = GRP_Settings_Settings_Configure:AddToggle("Bring_Mobs", {
 		Text = "Bring Mobs",
 		Default = true,
 		Callback = function(p134)
 			_B = p134
+
+			if not p134 then
+				-- desligou: solta tudo que estava congelado
+				LimparBodyVelocityInimigos()
+			end
 		end
 	})
+end
+
+-- enquanto o Bring Mobs estiver desligado, varre de tempos em tempos.
+-- (inimigos que respawnam herdam o BodyVelocity antigo do Model reusado)
+do
+	task.spawn(function()
+		while task.wait(5) do
+			if not _B then
+				pcall(LimparBodyVelocityInimigos)
+			end
+		end
+	end)
 end
 
 do
@@ -30981,6 +31224,9 @@ do
 		end
 
 		local connection2
+		-- CORRIGIDO (Zyon): referencia do DescendantAdded do personagem,
+		-- para poder soltar no desligamento do Fly (antes vazava).
+		local connection3
 
 		connection2 = RunService.Heartbeat:Connect(function()
 			if u1398 then
@@ -31018,7 +31264,18 @@ do
 				end
 			end
 
-			LocalPlayer3.Character.DescendantAdded:Connect(function(descendant)
+			-- CORRIGIDO (Zyon): esta conexao era criada toda vez que o Fly
+			-- era ligado e NUNCA desconectada — um handler acumulado por
+			-- ativacao, disparando a cada parte nova do personagem.
+			-- Guardamos a referencia para poder soltar no desligamento
+			-- (o disconnect esta no bloco de limpeza abaixo).
+			if connection3 then
+				pcall(function()
+					connection3:Disconnect()
+				end)
+			end
+
+			connection3 = LocalPlayer3.Character.DescendantAdded:Connect(function(descendant)
 				if u1398 and descendant:IsA("BasePart") then
 					descendant.CanCollide = false
 					descendant.Massless = true
@@ -31056,6 +31313,17 @@ do
 			if connection then
 				connection:Disconnect()
 				connection = nil
+			end
+
+			-- CORRIGIDO (Zyon): solta o DescendantAdded do personagem.
+			-- Antes, cada vez que o Fly era ligado, mais um handler ficava
+			-- preso no personagem para sempre.
+			if connection3 then
+				pcall(function()
+					connection3:Disconnect()
+				end)
+
+				connection3 = nil
 			end
 
 			if LocalPlayer3.Character then

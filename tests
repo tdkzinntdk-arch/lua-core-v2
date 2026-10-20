@@ -13477,7 +13477,12 @@ do
 								task.wait()
 								EquipWeapon(_G.SelectWeapon)
 								_tp(child.HumanoidRootPart.CFrame * CFrame.new(0, 0, 15))
-								sethiddenproperty(plr, "SimulationRadius", math.huge)
+								-- guarda: nem todo executor tem sethiddenproperty.
+								-- Ja estava dentro de pcall, mas sem checar a
+								-- existencia a chamada falhava em silencio.
+								if type(sethiddenproperty) == "function" then
+									pcall(sethiddenproperty, plr, "SimulationRadius", math.huge)
+								end
 
 								if _G.Defeating == false then
 									break
@@ -27352,7 +27357,10 @@ spawn(function()
 						return
 					end
 
-					sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
+					-- guarda de existencia (nem todo executor tem)
+					if type(sethiddenproperty) == "function" then
+						pcall(sethiddenproperty, LocalPlayer, "SimulationRadius", math.huge)
+					end
 
 					for _, child in pairs(workspace.Enemies:GetChildren()) do
 						if child:FindFirstChild("Humanoid") and child:FindFirstChild("HumanoidRootPart") and (child.HumanoidRootPart.Position - HumanoidRootPart.Position).Magnitude <= 500 and child.Humanoid.Health > 0 then

@@ -1,3 +1,7 @@
+-- Reliability patch applied 2026-10-20.
+-- Scope: bounded waits, Tween speed forwarding, forced-kick removal, and removal
+-- of __namecall interception that suppressed integrity-related remote calls.
+-- Factory/Pirate Raid branches remain unchanged and disabled pending verified mechanics.
 getgenv().Configs = {
 	Team = "Pirates",
 	FixLag = false,
@@ -342,24 +346,9 @@ task.spawn(function()
 end)
 print("ui initialized")
 
-pcall(function()
-    assert(getrawmetatable)
-    local grm = getrawmetatable(game)
-    setreadonly(grm, false)
-    local old = grm.__namecall
-    grm.__namecall = newcclosure(function(self, ...)
-        local args = {...}
-        local name = tostring(args[1])
-        for _, remote in ipairs({"TeleportDetect", "CHECKER_1", "CHECKER", "GUI_CHECK", "OneMoreTime", "checkingSPEED", "BANREMOTE", "PERMAIDBAN", "KICKREMOTE", "BR_KICKPC", "BR_KICKMOBILE"}) do
-            if name == remote then
-                return
-            end
-        end
-        return old(self, ...)
-    end)
-end)
-
-print("anti anticheat initialized")
+-- A interceptacao de __namecall para suprimir remotes de integridade foi removida.
+-- Alem de nao provar que previne expulsao, ela pode quebrar chamadas normais do jogo.
+print("integrity-hook interception disabled")
 
 local function EquipTool(v)
 	Character.Humanoid:EquipTool(LocalPlayer.Backpack:FindFirstChild(v))
@@ -503,7 +492,7 @@ local function EsperarPersonagem(timeout, precisaRoot)
 	end
 end
 
-local function RunTween(v, high)
+local function RunTween(v, high, requestedSpeed)
     if not EsperarPersonagem(30, true) then
         LogChange("tween_root", "tween: character unavailable")
         return
@@ -523,7 +512,9 @@ local function RunTween(v, high)
     local finalCFrame = CFrame.new(pos) * rot
     local distance = (rootPart.Position - finalCFrame.Position).Magnitude
     local speed
-    if distance < 250 then
+    if type(requestedSpeed) == "number" and requestedSpeed > 0 and requestedSpeed < math.huge then
+        speed = math.clamp(requestedSpeed, 25, 1000)
+    elseif distance < 250 then
         speed = 285
     elseif distance < 500 then
         speed = 260
@@ -626,7 +617,16 @@ local function SmartTween(t)
 		if not CollectionService:HasTag(LocalPlayer, "Teleporting") then
 			CommF_:InvokeServer("requestEntrance", _is[pos][1])
 		end
-		repeat task.wait() until (LocalPlayer:DistanceFromCharacter(_is[pos][1]) < LocalPlayer:DistanceFromCharacter(_is[pos][2]))
+        local entranceDeadline = tick() + 12
+        local entranceReached = false
+        repeat
+            task.wait(0.1)
+            entranceReached = LocalPlayer:DistanceFromCharacter(_is[pos][1]) < LocalPlayer:DistanceFromCharacter(_is[pos][2])
+        until entranceReached or tick() >= entranceDeadline
+        if not entranceReached then
+            warn("[Zyon] entrance approach timed out; skipping entrance request")
+            return
+        end
         print("travel: entrance reached")
         task.wait(0.25)
     end
@@ -636,30 +636,41 @@ local function Tween(v, speed, high)
         return
     end
     SmartTween(v)
-    return RunTween(v, high)
+    return RunTween(v, high, speed)
 end
 
-local function WaitForAliveCharacter()
-    while true do
+local function WaitForAliveCharacter(timeout)
+    timeout = math.max(1, tonumber(timeout) or 20)
+    local deadline = tick() + timeout
+    repeat
         local character = LocalPlayer.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         local root = character and character:FindFirstChild("HumanoidRootPart")
-        if character and humanoid and humanoid.Health > 0 and root then
+        if character and character.Parent and humanoid and humanoid.Health > 0 and root then
             return character, humanoid, root
         end
         task.wait(0.1)
-    end
+    until tick() >= deadline
+    warn(("[Zyon] character did not become alive within %ds"):format(timeout))
+    return nil, nil, nil
 end
 
 local function TweenWithRespawnRetry(target, speed, high)
-    while true do
+    local maxAttempts = 3
+    local attempt = 0
+    while attempt < maxAttempts do
+        attempt = attempt + 1
         local currentCharacter = LocalPlayer.Character
         local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
         local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
         if not currentCharacter or not currentHumanoid or currentHumanoid.Health <= 0 or not currentRoot then
             LogChange("respawn_wait", "tween: waiting for respawn")
         end
-        local startCharacter, humanoid, root = WaitForAliveCharacter()
+        local startCharacter, humanoid, root = WaitForAliveCharacter(20)
+        if not startCharacter or not humanoid or not root then
+            LogChange("respawn_wait", "tween: character wait timed out")
+            return false
+        end
         LogChange("respawn_wait", "tween: character ready")
         local died = false
         local activeTween = nil
@@ -699,8 +710,27 @@ local function TweenWithRespawnRetry(target, speed, high)
                 end)
             end
 
-            while not finished do
+            local targetPosition
+            if typeof(target) == "CFrame" then
+                targetPosition = target.Position
+            elseif typeof(target) == "Vector3" then
+                targetPosition = target
+            elseif typeof(target) == "Instance" and target:IsA("BasePart") then
+                targetPosition = target.Position
+            elseif typeof(target) == "Instance" and target:IsA("Model") then
+                targetPosition = target:GetPivot().Position
+            end
+            local distance = targetPosition and (root.Position - targetPosition).Magnitude or 0
+            local completionDeadline = tick() + math.clamp((distance / math.max(tonumber(speed) or 200, 25)) + 20, 20, 600)
+            while not finished and tick() < completionDeadline do
                 task.wait(0.05)
+            end
+            if not finished then
+                pcall(function() activeTween:Cancel() end)
+                completedConnection:Disconnect()
+                diedConnection:Disconnect()
+                warn("[Zyon] tween completion timed out; cancelled")
+                return false
             end
 
             completedConnection:Disconnect()
@@ -736,6 +766,7 @@ local function TweenWithRespawnRetry(target, speed, high)
             end
         end
     end
+    return false
 end
 
 task.spawn(function()
@@ -1716,7 +1747,9 @@ local function UnlockThirdSea()
 			if CheckMonster("rip_indra") then
 				KillMonster("rip_indra")
 			else
-				LocalPlayer:Kick("Rejoin to fix blox kid")
+                LogChange("sea3_stage", "sea 3: rip_indra unavailable; waiting for valid quest state")
+                SetStatus("sea 3 | waiting for rip_indra")
+                return false
 			end
 		elseif check == 1 then
             LogChange("sea3_stage", "sea 3: continuing quest")
@@ -3459,10 +3492,26 @@ end
 local function GetYama()
     LogChange("yama", "yama: unlocking")
     SetStatus("yama | unlocking")
-	repeat
-		fireclickdetector(workspace.Map.Waterfall.SealedKatana.Hitbox.ClickDetector)
-		task.wait(0.5)
-	until LocalPlayer.Backpack:FindFirstChild("Yama")
+    local deadline = tick() + 120
+    repeat
+        local map = workspace:FindFirstChild("Map")
+        local waterfall = map and map:FindFirstChild("Waterfall")
+        local sealedKatana = waterfall and waterfall:FindFirstChild("SealedKatana")
+        local hitbox = sealedKatana and sealedKatana:FindFirstChild("Hitbox")
+        local detector = hitbox and hitbox:FindFirstChildOfClass("ClickDetector")
+        if detector and fireclickdetector then
+            pcall(fireclickdetector, detector)
+        else
+            warn("[Zyon] Yama click detector unavailable")
+            return false
+        end
+        task.wait(0.5)
+    until LocalPlayer.Backpack:FindFirstChild("Yama") or tick() >= deadline
+    if not LocalPlayer.Backpack:FindFirstChild("Yama") then
+        warn("[Zyon] Yama acquisition timed out after 120s")
+        return false
+    end
+    return true
 end
 
 local function CheckTushita()

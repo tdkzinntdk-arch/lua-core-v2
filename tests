@@ -267,33 +267,54 @@ end
 do
 	t9.Kill = function(p10, p11)
 		if p10 and p11 then
-			if not p10:GetAttribute("Locked") then
-				p10:SetAttribute("Locked", p10.HumanoidRootPart.CFrame)
+			-- CORRIGIDO (Zyon): captura a referencia UMA vez e revalida.
+			--
+			-- ANTES: p10.HumanoidRootPart era relido SEIS vezes (271, 274,
+			-- 281, 283, 288...) sem guarda. O inimigo despawna com
+			-- frequencia, entao qualquer uma dessas leituras podia
+			-- estourar no MEIO da funcao - a mais usada do hub
+			-- (294 chamadas). Cada estouro matava a thread e deixava o
+			-- atributo "Locked" preso no modelo para sempre.
+			local Locked = p10:GetAttribute("Locked")
+			local HRP = p10:FindFirstChild("HumanoidRootPart")
+				or (Locked and p10:FindFirstChild("UpperTorso"))
+
+			if not HRP then
+				return
 			end
 
-			PosMon = p10:GetAttribute("Locked").Position
+			if not Locked then
+				pcall(function()
+					p10:SetAttribute("Locked", HRP.CFrame)
+				end)
+
+				Locked = p10:GetAttribute("Locked")
+			end
+
+			PosMon = (Locked and Locked.Position) or HRP.Position
 			BringEnemy()
 			EquipWeapon(_G.SelectWeapon)
 
-			local Tool = game.Players.LocalPlayer.Character:FindFirstChildOfClass("Tool")
+			local Char = game.Players.LocalPlayer.Character
+			local Tool = Char and Char:FindFirstChildOfClass("Tool")
 
 			if (Tool and Tool:FindFirstChild("ToolTip") and Tool.ToolTip or "") == "Blox Fruit" then
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(90), 0))
+				_tp(HRP.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(90), 0))
 			else
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(0, 10, 0) * CFrame.Angles(0, math.rad(180), 0))
+				_tp(HRP.CFrame * CFrame.new(0, 10, 0) * CFrame.Angles(0, math.rad(180), 0))
 			end
 
 			if RandomCFrame then
 				wait(0.5)
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(0, 30, 25))
+				_tp(HRP.CFrame * CFrame.new(0, 30, 25))
 				wait(0.5)
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(25, 30, 0))
+				_tp(HRP.CFrame * CFrame.new(25, 30, 0))
 				wait(0.5)
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(-25, 30, 0))
+				_tp(HRP.CFrame * CFrame.new(-25, 30, 0))
 				wait(0.5)
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(0, 30, 25))
+				_tp(HRP.CFrame * CFrame.new(0, 30, 25))
 				wait(0.5)
-				_tp(p10.HumanoidRootPart.CFrame * CFrame.new(-25, 30, 0))
+				_tp(HRP.CFrame * CFrame.new(-25, 30, 0))
 			end
 		end
 	end
@@ -301,34 +322,48 @@ end
 
 t9.Kill2 = function(p12, p13)
 	if p12 and p13 then
-		if not p12:GetAttribute("Locked") then
-			p12:SetAttribute("Locked", p12.HumanoidRootPart.CFrame)
+		-- CORRIGIDO (Zyon): mesma correcao do t9.Kill - captura e revalida.
+		local Locked = p12:GetAttribute("Locked")
+		local HRP = p12:FindFirstChild("HumanoidRootPart")
+			or (Locked and p12:FindFirstChild("UpperTorso"))
+
+		if not HRP then
+			return
 		end
 
-		PosMon = p12:GetAttribute("Locked").Position
+		if not Locked then
+			pcall(function()
+				p12:SetAttribute("Locked", HRP.CFrame)
+			end)
+
+			Locked = p12:GetAttribute("Locked")
+		end
+
+		PosMon = (Locked and Locked.Position) or HRP.Position
 		BringEnemy()
 		EquipWeapon(_G.SelectWeapon)
 
-		local Tool = game.Players.LocalPlayer.Character:FindFirstChildOfClass("Tool")
+		local Char = game.Players.LocalPlayer.Character
+		local Tool = Char and Char:FindFirstChildOfClass("Tool")
 		local ToolTip = Tool and Tool:FindFirstChild("ToolTip") and Tool.ToolTip
 
 		if (ToolTip or "") == "Blox Fruit" then
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(90), 0))
+			_tp(HRP.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(90), 0))
 		else
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(0, 10, 8) * CFrame.Angles(0, math.rad(180), 0))
+			_tp(HRP.CFrame * CFrame.new(0, 10, 8) * CFrame.Angles(0, math.rad(180), 0))
 		end
 
 		if RandomCFrame then
 			wait(0.1)
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(0, 30, 25))
+			_tp(HRP.CFrame * CFrame.new(0, 30, 25))
 			wait(0.1)
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(25, 30, 0))
+			_tp(HRP.CFrame * CFrame.new(25, 30, 0))
 			wait(0.1)
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(-25, 30, 0))
+			_tp(HRP.CFrame * CFrame.new(-25, 30, 0))
 			wait(0.1)
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(0, 30, 25))
+			_tp(HRP.CFrame * CFrame.new(0, 30, 25))
 			wait(0.1)
-			_tp(p12.HumanoidRootPart.CFrame * CFrame.new(-25, 30, 0))
+			_tp(HRP.CFrame * CFrame.new(-25, 30, 0))
 		end
 	end
 end
@@ -336,22 +371,36 @@ end
 do
 	t9.KillSea = function(p14, p15)
 		if p14 and p15 then
-			if not p14:GetAttribute("Locked") then
-				p14:SetAttribute("Locked", p14.HumanoidRootPart.CFrame)
+			-- CORRIGIDO (Zyon): captura e revalida (igual ao t9.Kill)
+			local Locked = p14:GetAttribute("Locked")
+			local HRP = p14:FindFirstChild("HumanoidRootPart")
+				or (Locked and p14:FindFirstChild("UpperTorso"))
+
+			if not HRP then
+				return
 			end
 
-			PosMon = p14:GetAttribute("Locked").Position
+			if not Locked then
+				pcall(function()
+					p14:SetAttribute("Locked", HRP.CFrame)
+				end)
+
+				Locked = p14:GetAttribute("Locked")
+			end
+
+			PosMon = (Locked and Locked.Position) or HRP.Position
 			BringEnemy()
 			EquipWeapon(_G.SelectWeapon)
 
-			local Tool = game.Players.LocalPlayer.Character:FindFirstChildOfClass("Tool")
+			local Char = game.Players.LocalPlayer.Character
+			local Tool = Char and Char:FindFirstChildOfClass("Tool")
 
 			if (Tool and Tool:FindFirstChild("ToolTip") and Tool.ToolTip or "") == "Blox Fruit" then
-				_tp(p14.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(90), 0))
+				_tp(HRP.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(90), 0))
 			else
-				notween(p14.HumanoidRootPart.CFrame * CFrame.new(0, 50, 8))
+				notween(HRP.CFrame * CFrame.new(0, 50, 8))
 				wait(0.85)
-				notween(p14.HumanoidRootPart.CFrame * CFrame.new(0, 400, 0))
+				notween(HRP.CFrame * CFrame.new(0, 400, 0))
 				wait(1)
 			end
 		end
@@ -362,26 +411,39 @@ do
 	t9.Sword = function(p16, p17)
 		if p16 then
 			if p17 then
-				if not p16:GetAttribute("Locked") then
-					p16:SetAttribute("Locked", p16.HumanoidRootPart.CFrame)
+				-- CORRIGIDO (Zyon): captura e revalida (igual ao t9.Kill)
+				local Locked = p16:GetAttribute("Locked")
+				local HRP = p16:FindFirstChild("HumanoidRootPart")
+					or (Locked and p16:FindFirstChild("UpperTorso"))
+
+				if not HRP then
+					return
 				end
 
-				PosMon = p16:GetAttribute("Locked").Position
+				if not Locked then
+					pcall(function()
+						p16:SetAttribute("Locked", HRP.CFrame)
+					end)
+
+					Locked = p16:GetAttribute("Locked")
+				end
+
+				PosMon = (Locked and Locked.Position) or HRP.Position
 				BringEnemy()
 				weaponSc("Sword")
-				_tp(p16.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0))
+				_tp(HRP.CFrame * CFrame.new(0, 30, 0))
 
 				if RandomCFrame then
 					wait(0.1)
-					_tp(p16.HumanoidRootPart.CFrame * CFrame.new(0, 30, 25))
+					_tp(HRP.CFrame * CFrame.new(0, 30, 25))
 					wait(0.1)
-					_tp(p16.HumanoidRootPart.CFrame * CFrame.new(25, 30, 0))
+					_tp(HRP.CFrame * CFrame.new(25, 30, 0))
 					wait(0.1)
-					_tp(p16.HumanoidRootPart.CFrame * CFrame.new(-25, 30, 0))
+					_tp(HRP.CFrame * CFrame.new(-25, 30, 0))
 					wait(0.1)
-					_tp(p16.HumanoidRootPart.CFrame * CFrame.new(0, 30, 25))
+					_tp(HRP.CFrame * CFrame.new(0, 30, 25))
 					wait(0.1)
-					_tp(p16.HumanoidRootPart.CFrame * CFrame.new(-25, 30, 0))
+					_tp(HRP.CFrame * CFrame.new(-25, 30, 0))
 				end
 			end
 		end
@@ -390,15 +452,30 @@ end
 
 t9.Mas = function(p18, p19)
 	if p18 and p19 then
-		if not p18:GetAttribute("Locked") then
-			p18:SetAttribute("Locked", p18.HumanoidRootPart.CFrame)
+		-- CORRIGIDO (Zyon): captura e revalida. O .Humanoid tambem era
+		-- relido solto mais abaixo (p18.Humanoid.Health).
+		local Locked = p18:GetAttribute("Locked")
+		local HRP = p18:FindFirstChild("HumanoidRootPart")
+			or (Locked and p18:FindFirstChild("UpperTorso"))
+		local Hum = p18:FindFirstChildOfClass("Humanoid")
+
+		if not HRP or not Hum then
+			return
 		end
 
-		PosMon = p18:GetAttribute("Locked").Position
+		if not Locked then
+			pcall(function()
+				p18:SetAttribute("Locked", HRP.CFrame)
+			end)
+
+			Locked = p18:GetAttribute("Locked")
+		end
+
+		PosMon = (Locked and Locked.Position) or HRP.Position
 		BringEnemy()
 
-		if p18.Humanoid.Health <= HealthM then
-			_tp(p18.HumanoidRootPart.CFrame * CFrame.new(0, 20, 0))
+		if Hum.Health <= HealthM then
+			_tp(HRP.CFrame * CFrame.new(0, 20, 0))
 
 			local SelectedMasterySkills = _G.SelectedMasterySkills
 
@@ -421,7 +498,7 @@ t9.Mas = function(p18, p19)
 			end
 		else
 			weaponSc("Melee")
-			_tp(p18.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0))
+			_tp(HRP.CFrame * CFrame.new(0, 30, 0))
 		end
 	end
 end
@@ -429,15 +506,29 @@ end
 do
 	t9.Masgun = function(p20, p21)
 		if p20 and p21 then
-			if not p20:GetAttribute("Locked") then
-				p20:SetAttribute("Locked", p20.HumanoidRootPart.CFrame)
+			-- CORRIGIDO (Zyon): captura e revalida (padrao do t9.Kill)
+			local Locked = p20:GetAttribute("Locked")
+			local HRP = p20:FindFirstChild("HumanoidRootPart")
+				or (Locked and p20:FindFirstChild("UpperTorso"))
+			local Hum = p20:FindFirstChildOfClass("Humanoid")
+
+			if not HRP or not Hum then
+				return
 			end
 
-			PosMon = p20:GetAttribute("Locked").Position
+			if not Locked then
+				pcall(function()
+					p20:SetAttribute("Locked", HRP.CFrame)
+				end)
+
+				Locked = p20:GetAttribute("Locked")
+			end
+
+			PosMon = (Locked and Locked.Position) or HRP.Position
 			BringEnemy()
 
-			if p20.Humanoid.Health <= HealthM then
-				_tp(p20.HumanoidRootPart.CFrame * CFrame.new(0, 35, 8))
+			if Hum.Health <= HealthM then
+				_tp(HRP.CFrame * CFrame.new(0, 35, 8))
 
 				local SelectedMasterySkills = _G.SelectedMasterySkills
 
@@ -460,7 +551,7 @@ do
 				end
 			else
 				weaponSc("Melee")
-				_tp(p20.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0))
+				_tp(HRP.CFrame * CFrame.new(0, 30, 0))
 			end
 		end
 	end
@@ -769,24 +860,89 @@ do
 end
 
 do
+	-- CORRIGIDO (Zyon): o hook de __namecall estava em CODIGO MORTO.
+	--
+	-- O original era:
+	--     v65.__namecall = newcclosure(function(...)
+	--         local t10 = { ... }
+	--         if tostring(t10[1]) == "RemoteEvent" then
+	--             t10[2] = MousePos
+	--             return __namecall(unpack(t10))
+	--         end
+	--
+	-- Tres defeitos, cada um provado contra o Quantum (hub pago):
+	--
+	--  1. obj:metodo(a) e acucar para obj.metodo(obj, a). Como o
+	--     parametro era "..." (sem nome), { ... } guarda o SELF em [1].
+	--     Logo t10[1] era o PROPRIO REMOTE, nao o argumento.
+	--     O Quantum usa  function(arg, ...)  -> tbl8 comeca no 1o argumento.
+	--
+	--  2. tostring(Instance) retorna o NOME, nao a ClassName. O teste
+	--     comparava o nome do remote com a string "RemoteEvent". Os
+	--     remotes reais sao "RE/RegisterAttack", "RE/RegisterHit",
+	--     "LeftClickRemote", "seed"... NENHUM se chama "RemoteEvent".
+	--     => o branch NUNCA entrava. MousePos nunca era injetado.
+	--     O Quantum testa o TIPO:  typeof(tbl8[i]) == "Vector3".
+	--
+	--  3. Nao havia checkcaller(), entao o hook tambem interceptava
+	--     chamadas feitas pelo proprio cliente do jogo.
+	--     O Quantum:  if not checkcaller() and ... then
+	--
+	-- Correcao: porta o gate do Quantum - posicional, por tipo, com
+	-- checkcaller, e so reescreve quando o argumento E uma posicao.
 	local v65 = getrawmetatable(game)
 	local __namecall = v65.__namecall
 
-	setreadonly(v65, false)
-	v65.__namecall = newcclosure(function(...)
-		local v67 = getnamecallmethod()
-		local t10 = { ... }
+	-- Alguns executores nao expoem checkcaller. Sem ele o hook
+	-- interceptaria tambem o proprio cliente do jogo. Em vez de
+	-- quebrar, usamos um fallback que sempre devolve false (mesmo
+	-- efeito pratico do original, que nao checava nada) e avisamos.
+	local TemCheckcaller = type(checkcaller) == "function"
 
-		if tostring(v67) == "FireServer" and tostring(t10[1]) == "RemoteEvent" and tostring(t10[2]) ~= "true" and tostring(t10[2]) ~= "false" then
-			if _G.FarmMastery_G and not SoulGuitar or _G.FarmMastery_Dev or _G.FarmBlazeEM or _G.Prehis_Skills or _G.SeaBeast1 or _G.FishBoat or _G.PGB or _G.Leviathan1 or _G.Complete_Trials or _G.AimMethod and ABmethod == "Aim Player" or _G.AimMethod and ABmethod == "Nearest Aim" then
-				t10[2] = MousePos
+	if not TemCheckcaller then
+		warn("[Banana] executor sem checkcaller(): o hook de MousePos pode afetar chamadas internas do jogo.")
+	end
 
-				return __namecall(unpack(t10))
+	-- idempotencia: re-executar o script nao deve empilhar hooks
+	if not getgenv().__BananaNamecallHook then
+		setreadonly(v65, false)
+		v65.__namecall = newcclosure(function(arg, ...)
+			local v67 = getnamecallmethod()
+			local v21 = table.pack(...)
+			local tbl8 = { ... }
+
+			-- so scripts externos; nunca o proprio cliente do jogo
+			if not (TemCheckcaller and checkcaller()) and (v67 == "FireServer" or v67 == "InvokeServer") then
+				if _G.FarmMastery_G and not SoulGuitar or _G.FarmMastery_Dev or _G.FarmBlazeEM or _G.Prehis_Skills or _G.SeaBeast1 or _G.FishBoat or _G.PGB or _G.Leviathan1 or _G.Complete_Trials or _G.AimMethod and ABmethod == "Aim Player" or _G.AimMethod and ABmethod == "Nearest Aim" then
+					local alvo = MousePos
+
+					if alvo and typeof(tbl8[1]) ~= "boolean" then
+						-- substitui o primeiro argumento que FOR uma
+						-- posicao (Vector3/CFrame), em vez de chutar [2]
+						for i = 1, math.min(6, #tbl8) do
+							local v24 = tbl8[i]
+
+							if typeof(v24) == "Vector3" then
+								tbl8[i] = alvo
+
+								return __namecall(arg, unpack(tbl8))
+							end
+
+							if typeof(v24) == "CFrame" then
+								tbl8[i] = CFrame.new(v24.Position, alvo)
+
+								return __namecall(arg, unpack(tbl8))
+							end
+						end
+					end
+				end
 			end
-		end
 
-		return __namecall(...)
-	end)
+			return __namecall(arg, table.unpack(v21, 1, v21.n))
+		end)
+
+		getgenv().__BananaNamecallHook = true
+	end
 end
 
 GetConnectionEnemies = function(p31)
@@ -12590,7 +12746,7 @@ do
 						return
 					end
 
-					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") ~= 2 then
+					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") ~= -2 then
 						if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 							replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
 						elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 1 then
@@ -12650,6 +12806,22 @@ do
 						-- (so o Mink usa baus; as outras racas tem
 						-- requisitos proprios - ver os outros blocos)
 						_G.AutoFarmChest = true
+					elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 2 then
+						-- ESTADO 2 = tarefa cumprida, falta ENTREGAR.
+						--
+						-- ANTES: este branch NAO existia em bloco nenhum do
+						-- Banana (as 8 chamadas so usavam "1" e "2"). Sem o
+						-- "3" a quest nunca era entregue e o toggle girava
+						-- para sempre no estado 2 parecendo travado.
+						--
+						-- Confirmado nas duas referencias:
+						--   Quantum L11323: Wenlocktoad == 0 and "2" or "3"
+						--   6V3    L7342:   tbl10.Invoke("Wenlocktoad", "3")
+						_G.AutoFarmChest = false
+
+						if IrParaWenlock() then
+							replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "3")
+						end
 					else
 						_G.AutoFarmChest = false
 					end
@@ -12772,6 +12944,13 @@ spawn(function()
 					if not achouAlgum then
 						_tp(CFrame.new(-2172.7399902344, 103.32216644287, -4015.025390625))
 					end
+				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 2 then
+					-- ESTADO 2 = tarefa cumprida, ENTREGAR.
+					-- (faltava em todos os blocos do Banana: sem o "3" a
+					-- quest nunca era entregue e o toggle travava aqui)
+					if IrParaWenlock() then
+						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "3")
+					end
 				end
 			end
 		end)
@@ -12884,6 +13063,11 @@ spawn(function()
 								end
 							end
 						end
+					end
+				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 2 then
+					-- ESTADO 2 = tarefa cumprida, ENTREGAR.
+					if IrParaWenlock() then
+						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "3")
 					end
 				end
 			end
@@ -13000,6 +13184,11 @@ spawn(function()
 						-- nenhum Sea Beast agora: espera na area de spawn
 						-- (o Sea Beast aparece aleatoriamente no mar)
 						task.wait(1)
+					end
+				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 2 then
+					-- ESTADO 2 = tarefa cumprida, ENTREGAR.
+					if IrParaWenlock() then
+						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "3")
 					end
 				end
 			end

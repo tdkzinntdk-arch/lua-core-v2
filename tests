@@ -3242,6 +3242,10 @@ local function MeleeKaitunLogic()
 		CheckMeleeMastery()
 	end
 	for _, v in {"BlackLeg", "Electro", "FishmanKarate"} do
+		-- Electric deve ser comprado no Sea 1; no Sea 2/3 nao bloqueie o farm tentando compra-lo.
+		if v == "Electro" and not World.Sea1() then
+			continue
+		end
 		local realName = GetMeleeToolName(v)
 
 			if (MeleeData[v] or 0) < 400 then

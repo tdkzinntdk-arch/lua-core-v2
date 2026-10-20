@@ -995,14 +995,94 @@ do
 end
 
 do
+	-- ════════════════════════════════════════════════════════════════════
+	--  LIMITE DE ARMAZENAMENTO DE FRUTAS
+	--  Adicionado por Zyon.
+	--
+	--  Antes: UpdStFruit disparava StoreFruit para TODA fruta do Backpack,
+	--  sem checar se o tipo ja estava no limite. Quando o limite estoura,
+	--  o servidor recusa em silencio — o script martela o remote para
+	--  sempre sem efeito nenhum.
+	--
+	--  Agora: consultamos getInventoryFruits, contamos por TIPO e
+	--  mantemos uma lista de pausa. Tipo no limite entra na pausa e nao
+	--  gera mais InvokeServer ate o jogador tirar fruta da loja.
+	-- ════════════════════════════════════════════════════════════════════
+	local FRUIT_LIMIT_PER_TYPE = 2
+
+	-- nome do tipo -> true quando ja bateu o limite
+	FrutasEmPausa = {}
+
+	local ultima_leitura = 0
+
+	-- le o inventario de frutas guardadas e remonta a lista de pausa
+	function AtualizarFrutasEmPausa(forcar)
+		local agora = os.clock()
+
+		-- no maximo 1 leitura a cada 3s: getInventoryFruits e caro
+		if not forcar and (agora - ultima_leitura) < 3 then
+			return
+		end
+
+		ultima_leitura = agora
+
+		local ok, inventario = pcall(function()
+			return replicated.Remotes.CommF_:InvokeServer("getInventoryFruits")
+		end)
+
+		if not ok or type(inventario) ~= "table" then
+			return
+		end
+
+		local contagem = {}
+
+		for _, item in pairs(inventario) do
+			if type(item) == "table" then
+				local nome = item.Name
+
+				if nome then
+					contagem[nome] = (contagem[nome] or 0) + 1
+				end
+			end
+		end
+
+		FrutasEmPausa = {}
+
+		for nome, qtd in pairs(contagem) do
+			if qtd >= FRUIT_LIMIT_PER_TYPE then
+				FrutasEmPausa[nome] = true
+			end
+		end
+	end
+
+	-- true se essa fruta NAO deve ser guardada agora
+	function FrutaEmPausa(nome)
+		if not nome then
+			return true
+		end
+
+		return FrutasEmPausa[nome] == true
+	end
+end
+
+do
 	UpdStFruit = function()
+		-- CORRIGIDO: consulta o inventario antes de tentar guardar.
+		-- So tenta as frutas que ainda nao bateram o limite.
+		AtualizarFrutasEmPausa()
+
 		local children, v102 = plr.Backpack:GetChildren()
 
 		for _, v1 in next, children, v102 do
 			StoreFruit = v1:FindFirstChild("EatRemote", true)
 
 			if StoreFruit then
-				replicated.Remotes.CommF_:InvokeServer("StoreFruit", StoreFruit.Parent:GetAttribute("OriginalName"), plr.Backpack:FindFirstChild(v1.Name))
+				local nomeOriginal = StoreFruit.Parent:GetAttribute("OriginalName")
+
+				-- pula o que ja esta no limite
+				if not FrutaEmPausa(nomeOriginal) then
+					replicated.Remotes.CommF_:InvokeServer("StoreFruit", nomeOriginal, plr.Backpack:FindFirstChild(v1.Name))
+				end
 			end
 		end
 	end
@@ -1012,9 +1092,34 @@ collectFruits = function(p32)
 	if p32 then
 		local Character = plr.Character
 
+		if not Character then
+			return
+		end
+
+		local HRP = Character:FindFirstChild("HumanoidRootPart")
+
+		if not HRP then
+			return
+		end
+
 		for _, child in pairs(workspace:GetChildren()) do
 			if string.find(child.Name, "Fruit") then
-				child.Handle.CFrame = Character.HumanoidRootPart.CFrame
+				-- CORRIGIDO: antes acessava child.Handle sem checar.
+				-- Fruta no chao nem sempre tem Handle (pode ser Model sem
+				-- PrimaryPart, ou estar sendo carregada) e o acesso direto
+				-- quebrava a coleta inteira.
+				local Handle = child:FindFirstChild("Handle") or child.PrimaryPart
+
+				if Handle and Handle:IsA("BasePart") then
+					-- fruta no limite de armazenamento: nao puxa
+					local nomeOriginal = child:GetAttribute("OriginalName") or child.Name
+
+					if not FrutaEmPausa(nomeOriginal) then
+						pcall(function()
+							Handle.CFrame = HRP.CFrame
+						end)
+					end
+				end
 			end
 		end
 	end
@@ -1805,11 +1910,19 @@ do
 							end
 
 							-- solta qualquer corpo de velocidade preso
-							for _, nome in ipairs({ "BodyClip" }) do
-								local corpo = HRP:FindFirstChild(nome)
+							-- limpeza centralizada: destroi todos os corpos de
+							-- velocidade e solta o personagem no chao.
+							-- Usa a funcao global (definida logo abaixo do _tp)
+							-- se existir; senao faz o minimo.
+							if type(LimparFisica) == "function" then
+								LimparFisica()
+							else
+								for _, nome in ipairs({ "BodyClip" }) do
+									local corpo = HRP:FindFirstChild(nome)
 
-								if corpo then
-									corpo:Destroy()
+									if corpo then
+										corpo:Destroy()
+									end
 								end
 							end
 						end)
@@ -1823,6 +1936,185 @@ do
 		end)
 
 		return tween
+	end
+end
+
+-- ════════════════════════════════════════════════════════════════════════
+--  STOP TWEEN / LIMPEZA DE FISICA  (SafeTween)
+--  Adicionado por Zyon.
+--
+--  O teleporte prende o personagem a um Part invisivel tweenado, usando
+--  BodyVelocity ("BodyClip") para anular a fisica. Quando o tween era
+--  cancelado ou falhava, esse corpo ficava PRESO no personagem — o
+--  jogador travava flutuando, sem conseguir se mover.
+--
+--  StopTween faz a limpeza completa:
+--    1. cancela o tween ativo
+--    2. destroi BodyClip / BodyVelocity / LinearVelocity
+--    3. Humanoid.PlatformStand = false
+--    4. solta o personagem no chao
+-- ════════════════════════════════════════════════════════════════════════
+do
+	local tween_ativo = nil
+	local ultimo_movimento = os.clock()
+	local ultima_posicao = nil
+	local trava_avisada = false
+
+	-- registra o tween atual para poder cancela-lo depois
+	function RegistrarTween(t)
+		tween_ativo = t
+		ultimo_movimento = os.clock()
+	end
+
+	function GetTweenAtivo()
+		return tween_ativo
+	end
+
+	-- remove TODO corpo de velocidade preso no personagem
+	function LimparFisica()
+		local Char = plr and plr.Character
+
+		if not Char then
+			return
+		end
+
+		local HRP = Char:FindFirstChild("HumanoidRootPart")
+
+		if HRP then
+			for _, nome in ipairs({ "BodyClip", "BodyVelocity", "LinearVelocity", "BodyGyro", "BodyAngularVelocity" }) do
+				for _, obj in ipairs(HRP:GetChildren()) do
+					if obj.Name == nome then
+						pcall(function()
+							obj:Destroy()
+						end)
+					end
+				end
+			end
+		end
+
+		local Hum = Char:FindFirstChildOfClass("Humanoid")
+
+		if Hum then
+			pcall(function()
+				Hum.PlatformStand = false
+			end)
+
+			pcall(function()
+				Hum.AutoRotate = true
+			end)
+
+			pcall(function()
+				Hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end)
+		end
+
+		-- solta o personagem no chao
+		if HRP then
+			pcall(function()
+				local Raio = RaycastParams.new()
+
+				Raio.FilterDescendantsInstances = { Char }
+				Raio.FilterType = Enum.RaycastFilterType.Exclude
+
+				local Resultado = workspace:Raycast(HRP.Position, Vector3.new(0, -500, 0), Raio)
+
+				if Resultado then
+					HRP.CFrame = CFrame.new(Resultado.Position + Vector3.new(0, 3, 0))
+				end
+			end)
+		end
+	end
+
+	-- cancela o teleporte e limpa tudo
+	function StopTween()
+		if tween_ativo then
+			pcall(function()
+				tween_ativo:Cancel()
+			end)
+
+			tween_ativo = nil
+		end
+
+		LimparFisica()
+		shouldTween = false
+	end
+
+	-- ── watchdog: detecta o jogador preso no mesmo lugar ────────────────
+	-- Se o personagem ficar parado na mesma posicao por muito tempo
+	-- enquanto o tween deveria estar rodando, algo travou. Limpamos.
+	task.spawn(function()
+		local TEMPO_TRAVADO = 8      -- segundos parado para considerar travado
+		local INTERVALO = 2
+
+		while task.wait(INTERVALO) do
+			pcall(function()
+				local Char = plr and plr.Character
+
+				if not Char then
+					ultima_posicao = nil
+					return
+				end
+
+				local HRP = Char:FindFirstChild("HumanoidRootPart")
+				local Hum = Char:FindFirstChildOfClass("Humanoid")
+
+				if not HRP or not Hum then
+					ultima_posicao = nil
+					return
+				end
+
+				local pos = HRP.Position
+
+				if ultima_posicao then
+					local parado = (pos - ultima_posicao).Magnitude < 1
+
+					-- so consideramos travado se o tween deveria estar ativo
+					if parado and shouldTween and Hum.Health > 0 then
+						local tempo = os.clock() - ultimo_movimento
+
+						if tempo > TEMPO_TRAVADO then
+							StopTween()
+
+							if not trava_avisada then
+								trava_avisada = true
+
+								lib:Notify({
+									Title = "Movimento",
+									Description = "Voce ficou preso. Movimento cancelado e personagem liberado.",
+									Icon = "rbxassetid://5009915795",
+									Duration = 6
+								})
+
+								task.spawn(function()
+									task.wait(30)
+									trava_avisada = false
+								end)
+							end
+						end
+					else
+						ultimo_movimento = os.clock()
+					end
+				end
+
+				ultima_posicao = pos
+			end)
+		end
+	end)
+
+	-- marca movimento quando o _tp roda
+	local _tp_original = _tp
+
+	_tp = function(alvo)
+		ultimo_movimento = os.clock()
+		ultima_posicao = nil
+
+		local t = _tp_original(alvo)
+
+		if t then
+			RegistrarTween(t)
+		end
+
+		return t
 	end
 end
 
@@ -11876,6 +12168,129 @@ task.spawn(function()
 end)
 GRP_Race_Upgrade_Races_V2_And_V3 = t15.Race:AddLeftGroupbox("Upgrade Races V2 And V3")
 
+-- ════════════════════════════════════════════════════════════════════════
+--  CHECAGEM PREVIA DE RACE V2 / V3
+--  Adicionado por Zyon. Definido ANTES dos blocos de race para que todos
+--  (Mink, Human, Skypiea, Fish) enxerguem as funcoes.
+--
+--  Antes: o codigo ia direto no Alchemist/Wenlocktoad sem checar nada.
+--  Se faltasse Beli ou Level, o servidor recusava em silencio e o loop
+--  girava para sempre — parecia travado, mas era requisito faltando.
+--
+--  Requisitos reais (confirmados no NightRace_fixed.txt):
+--     V2 -> 500.000 Beli
+--     V3 -> 2.000.000 Beli  +  Level 1000+
+--
+--  OBS: o argumento do remote e "Wenlocktoad". "Arowe" e apenas o
+--  display name do NPC no mapa — usar "Arowe" no InvokeServer falha.
+-- ════════════════════════════════════════════════════════════════════════
+do
+	local RACE_V2_BELI = 500000
+	local RACE_V3_BELI = 2000000
+	local RACE_V3_LEVEL = 1000
+
+	-- le Beli/Level com seguranca
+	function RaceDados()
+		local ok, dados = pcall(function()
+			local Data = plr and plr:FindFirstChild("Data")
+
+			if not Data then
+				return nil
+			end
+
+			local Beli = Data:FindFirstChild("Beli")
+			local Level = Data:FindFirstChild("Level")
+			local Race = Data:FindFirstChild("Race")
+
+			if not Beli or not Level then
+				return nil
+			end
+
+			return {
+				Beli = Beli.Value,
+				Level = Level.Value,
+				Race = Race and Race.Value or "?"
+			}
+		end)
+
+		if ok then
+			return dados
+		end
+
+		return nil
+	end
+
+	-- retorna true se pode tentar; false + motivo se nao pode
+	function PodeRace(nivel)
+		local d = RaceDados()
+
+		if not d then
+			return false, "Dados do jogador ainda nao carregaram."
+		end
+
+		if nivel == "V2" then
+			if d.Beli < RACE_V2_BELI then
+				return false, string.format(
+					"Race V2 precisa de %d Beli (voce tem %d).",
+					RACE_V2_BELI, d.Beli
+				)
+			end
+		else
+			if d.Level < RACE_V3_LEVEL then
+				return false, string.format(
+					"Race V3 precisa de Level %d (voce tem %d).",
+					RACE_V3_LEVEL, d.Level
+				)
+			end
+
+			if d.Beli < RACE_V3_BELI then
+				return false, string.format(
+					"Race V3 precisa de %d Beli (voce tem %d).",
+					RACE_V3_BELI, d.Beli
+				)
+			end
+		end
+
+		return true, d
+	end
+
+	-- avisa uma vez por motivo, sem spammar a tela
+	local ultimo_aviso = nil
+	local ultimo_tempo = 0
+
+	function RaceAvisar(motivo)
+		local agora = os.clock()
+
+		if ultimo_aviso == motivo and (agora - ultimo_tempo) < 30 then
+			return
+		end
+
+		ultimo_aviso = motivo
+		ultimo_tempo = agora
+
+		pcall(function()
+			lib:Notify({
+				Title = "Race Upgrade",
+				Description = motivo,
+				Icon = "rbxassetid://5009915795",
+				Duration = 6
+			})
+		end)
+	end
+
+	-- usada no inicio de cada bloco de race: checa e avisa
+	function RacePrecisaParar(nivel)
+		local pode, info = PodeRace(nivel)
+
+		if not pode then
+			RaceAvisar(info)
+			return true
+		end
+
+		return false
+	end
+end
+
 do
 	RaceMink = GRP_Race_Upgrade_Races_V2_And_V3:AddToggle("Auto_Upgrade_Mink", {
 		Text = "Auto Upgrade Mink",
@@ -11891,6 +12306,11 @@ do
 		while wait(Sec) do
 			pcall(function()
 				if _G.Auto_Mink then
+					-- CORRIGIDO: checa Beli/Level antes de chamar o Alchemist
+					if RacePrecisaParar("V2") then
+						return
+					end
+
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") ~= 2 then
 						if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 							replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
@@ -11956,10 +12376,18 @@ RaceHuman = GRP_Race_Upgrade_Races_V2_And_V3:AddToggle("Auto_Upgrade_Human", {
 		_G.Auto_Human = p229
 	end
 })
+
 spawn(function()
 	while wait(Sec) do
 		pcall(function()
 			if _G.Auto_Human then
+				-- CORRIGIDO: checa Beli/Level ANTES de chamar o Alchemist.
+				-- Sem isso o servidor recusava em silencio e o loop girava
+				-- para sempre parecendo travado.
+				if RacePrecisaParar("V2") then
+					return
+				end
+
 				if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") ~= -2 then
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
@@ -12091,6 +12519,11 @@ spawn(function()
 	while wait(Sec) do
 		pcall(function()
 			if _G.Auto_Skypiea then
+				-- CORRIGIDO: checa Beli/Level antes de chamar o Alchemist
+				if RacePrecisaParar("V2") then
+					return
+				end
+
 				if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") ~= -2 then
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
@@ -12173,6 +12606,11 @@ spawn(function()
 	while wait(Sec) do
 		pcall(function()
 			if _G.Auto_Fish then
+				-- CORRIGIDO: checa Beli/Level antes de chamar o Alchemist
+				if RacePrecisaParar("V2") then
+					return
+				end
+
 				if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") ~= -2 then
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
@@ -28799,10 +29237,35 @@ do
 		while wait(Sec) do
 			if _G.TwFruits then
 				pcall(function()
+					-- atualiza a lista de pausa antes de sair tweenando
+					AtualizarFrutasEmPausa()
+
+					local alvo = nil
+
 					for _, child in pairs(workspace:GetChildren()) do
 						if string.find(child.Name, "Fruit") then
-							_tp(child.Handle.CFrame)
+							-- CORRIGIDO: valida o Handle antes de usar.
+							-- child.Handle direto quebrava quando a fruta era
+							-- um Model sem Handle — e como isso acontecia
+							-- dentro do _tp, o tween ficava pela metade e o
+							-- jogador travava flutuando.
+							local Handle = child:FindFirstChild("Handle") or child.PrimaryPart
+
+							if Handle and Handle:IsA("BasePart") then
+								local nomeOriginal = child:GetAttribute("OriginalName") or child.Name
+
+								-- fruta no limite: nao vale a pena tweenar
+								if not FrutaEmPausa(nomeOriginal) then
+									alvo = Handle
+									break
+								end
+							end
 						end
+					end
+
+					-- so chama _tp com um alvo validado
+					if alvo then
+						_tp(alvo.CFrame)
 					end
 				end)
 			end

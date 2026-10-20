@@ -12364,6 +12364,100 @@ do
 		return GetBP(nomeItem) ~= nil
 	end
 
+	-- ── MOTOR DA RACE V3 (Wenlocktoad) ─────────────────────────────────
+	-- Adicionado por Zyon. Antes o Banana tinha 3 defeitos que impediam
+	-- a V3 de funcionar em QUALQUER raca:
+	--
+	--   1. Chamava InvokeServer("Wenlocktoad", "2") de qualquer lugar do
+	--      mapa. O servidor exige proximidade do NPC. Confirmado no
+	--      QuantumOnyxPremium L11322:
+	--         if DistanceFromCharacter(Vector3.new(-1992,125,-73)) <= 4 then
+	--             FireInvoke("Wenlocktoad", ...)
+	--         else
+	--             tweenManager:topos(Vector3.new(-1992,125,-73))  -- vai ate ele
+	--
+	--   2. Nao checava se o jogador ja e V2 (Race.Evolved). Sem isso a V3
+	--      nunca libera.
+	--
+	--   3. Usava "Fajita" na lista de bosses da Human V3. O correto e
+	--      Orbitus. Confirmado em DOIS hubs:
+	--         Quantum L2136: HumanRace = { Orbitus=true, Diamond=true, Jeremy=true }
+	--         6V3   L7250:  Diamond / Jeremy / Orbitus
+	--
+	-- A posicao do Wenlocktoad e (-1992, 125, -73), do Quantum L11322.
+
+	-- posicao oficial do NPC Wenlocktoad
+	local WENLOCK_POS = Vector3.new(-1992, 125, -73)
+	local WENLOCK_RAIO = 8
+
+	-- bosses corretos da Human V3 (Fajita NAO entra)
+	local HUMAN_V3_BOSSES = { "Diamond", "Orbitus", "Jeremy" }
+
+	-- distancia ate um ponto (segura contra Character nil)
+	function DistanciaAte(pos)
+		local Char = plr and plr.Character
+
+		if not Char then
+			return nil
+		end
+
+		local HRP = Char:FindFirstChild("HumanoidRootPart")
+
+		if not HRP then
+			return nil
+		end
+
+		local ok, d = pcall(function()
+			return (HRP.Position - pos).Magnitude
+		end)
+
+		if ok and type(d) == "number" then
+			return d
+		end
+
+		return nil
+	end
+
+	-- vai ate o Wenlocktoad e espera chegar
+	function IrParaWenlock()
+		local d = DistanciaAte(WENLOCK_POS)
+
+		if not d then
+			return false
+		end
+
+		if d <= WENLOCK_RAIO then
+			return true
+		end
+
+		pcall(function()
+			_tp(CFrame.new(WENLOCK_POS))
+		end)
+
+		return false
+	end
+
+	-- o jogador ja e V2? (a V3 exige V2 antes)
+	function JaEhV2()
+		local ok, evoluido = pcall(function()
+			local Data = plr and plr:FindFirstChild("Data")
+
+			if not Data then
+				return false
+			end
+
+			local Race = Data:FindFirstChild("Race")
+
+			if not Race then
+				return false
+			end
+
+			return Race:FindFirstChild("Evolved") ~= nil
+		end)
+
+		return ok and evoluido == true
+	end
+
 	-- le Beli/Level com seguranca
 	function RaceDados()
 		local ok, dados = pcall(function()
@@ -12401,6 +12495,16 @@ do
 
 		if not d then
 			return false, "Dados do jogador ainda nao carregaram."
+		end
+
+		-- A quest de race V2 e V3 SO funciona no Second Sea.
+		-- Confirmado no 6V3PullLever L7693/L7735:
+		--   if not tbl2[placeId] then
+		--       return false, "The Fishman V3 quest only works in the Second Sea"
+		-- O Banana nunca checava isso - fora do Second Sea a quest nao
+		-- funciona por mais que todo o resto esteja certo.
+		if not World2 then
+			return false, "A quest de Race V2/V3 so funciona no Second Sea."
 		end
 
 		if nivel == "V2" then
@@ -12536,8 +12640,15 @@ do
 							replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
 						end
 					elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 0 then
-						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+						-- vai ate o NPC ANTES de chamar (o servidor exige
+						-- proximidade; chamar de longe nao faz nada)
+						if IrParaWenlock() then
+							replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+						end
 					elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 1 then
+						-- V3 do Mink (Rabbit): farmar BAUS
+						-- (so o Mink usa baus; as outras racas tem
+						-- requisitos proprios - ver os outros blocos)
 						_G.AutoFarmChest = true
 					else
 						_G.AutoFarmChest = false
@@ -12617,74 +12728,49 @@ spawn(function()
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
 					end
 				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 0 then
-					replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+					-- vai ate o NPC antes de chamar
+					if IrParaWenlock() then
+						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+					end
 				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 1 then
-					local v975 = GetConnectionEnemies(t4[1])
-					local v976
+					-- V3 do Human: matar os 3 bosses corretos.
+					--
+					-- ANTES: o codigo usava t4 = { "Fajita", "Jeremy", "Diamond" }.
+					-- "Fajita" NAO e boss da V3 — o correto e "Orbitus".
+					-- Matar Fajita nao creditava nada, entao a quest nunca
+					-- avancava: o jogador farmava para sempre sem progredir.
+					--
+					-- Confirmado em dois hubs independentes:
+					--   Quantum L2136: HumanRace = { Orbitus, Diamond, Jeremy }
+					--   6V3   L7250:  Diamond / Jeremy / Orbitus
+					--
+					-- Agora varremos os 3 nomes e atacamos o que estiver vivo,
+					-- sem depender de ordem nem de posicao fixa.
+					local achouAlgum = false
 
-					if v975 then
-						while true do
-							wait()
-							t9.Kill(v975, _G.Auto_Human)
+					for _, nomeBoss in ipairs(HUMAN_V3_BOSSES) do
+						local mob = GetConnectionEnemies(nomeBoss)
 
-							if v975.Humanoid.Health <= 0 then
-								break
-							elseif not v975.Parent or not _G.Auto_Human then
-								break
-							end
-						end
+						if mob then
+							achouAlgum = true
 
-						v976 = GetConnectionEnemies(t4[2])
-
-						if v976 then
 							while true do
 								wait()
-								t9.Kill(v976, _G.Auto_Human)
+								t9.Kill(mob, _G.Auto_Human)
 
-								if v976.Humanoid.Health <= 0 then
+								if mob.Humanoid.Health <= 0 then
 									break
-								elseif not v976.Parent or not _G.Auto_Human then
+								elseif not mob.Parent or not _G.Auto_Human then
 									break
 								end
 							end
-						else
-							_tp(CFrame.new(2006.9261474609, 448.95666503906, 853.98284912109))
-						end
-					else
-						_tp(CFrame.new(-2172.7399902344, 103.32216644287, -4015.025390625))
-						v976 = GetConnectionEnemies(t4[2])
-
-						if v976 then
-							while true do
-								wait()
-								t9.Kill(v976, _G.Auto_Human)
-
-								if v976.Humanoid.Health <= 0 then
-									break
-								elseif not v976.Parent or not _G.Auto_Human then
-									break
-								end
-							end
-						else
-							_tp(CFrame.new(2006.9261474609, 448.95666503906, 853.98284912109))
 						end
 					end
 
-					local v977 = GetConnectionEnemies(t4[3])
-
-					if v977 then
-						while true do
-							wait()
-							t9.Kill(v977, _G.Auto_Human)
-
-							if v977.Humanoid.Health <= 0 then
-								break
-							elseif not v977.Parent or not _G.Auto_Human then
-								break
-							end
-						end
-					else
-						_tp(CFrame.new(-1576.7166748047, 198.59265136719, 13.724286079407))
+					-- nenhum dos 3 spawnou: vai para onde eles costumam
+					-- aparecer e espera (o respawn e por servidor)
+					if not achouAlgum then
+						_tp(CFrame.new(-2172.7399902344, 103.32216644287, -4015.025390625))
 					end
 				end
 			end
@@ -12757,18 +12843,44 @@ spawn(function()
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
 					end
 				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 0 then
-					replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+					-- vai ate o NPC antes de chamar
+					if IrParaWenlock() then
+						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+					end
 				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 1 then
+					-- V3 do Skypiea: matar jogadores de raca Skypiea.
+					--
+					-- ANTES: acessava child.Data / child.Humanoid /
+					-- child.HumanoidRootPart direto. Se o jogador estivesse
+					-- carregando, morto ou saindo, isso estourava um erro e
+					-- derrubava a thread inteira da race.
 					for _, child in pairs(game.Players:GetChildren()) do
-						if child.Name ~= plr.Name and tostring(child.Data.Race.Value) == "Skypiea" then
-							while true do
-								task.wait()
-								_tp(child.HumanoidRootPart.CFrame * CFrame.new(0, 8, 0) * CFrame.Angles(math.rad(-45), 0, 0))
+						if child.Name ~= plr.Name then
+							-- todas as checagens com guarda
+							local Data = child:FindFirstChild("Data")
+							local Race = Data and Data:FindFirstChild("Race")
+							local Char = child.Character
+							local HRP = Char and Char:FindFirstChild("HumanoidRootPart")
+							local Hum = Char and Char:FindFirstChildOfClass("Humanoid")
 
-								if child.Humanoid.Health <= 0 then
-									break
-								elseif _G.Auto_Skypiea == false then
-									break
+							if Race and tostring(Race.Value) == "Skypiea" and HRP and Hum and Hum.Health > 0 then
+								local alvo = child
+
+								while true do
+									task.wait()
+
+									-- revalida a cada volta (o alvo pode morrer/sair)
+									local c2 = alvo.Character
+									local h2 = c2 and c2:FindFirstChild("HumanoidRootPart")
+									local hum2 = c2 and c2:FindFirstChildOfClass("Humanoid")
+
+									if not h2 or not hum2 or hum2.Health <= 0 or not _G.Auto_Skypiea then
+										break
+									end
+
+									pcall(function()
+										_tp(h2.CFrame * CFrame.new(0, 8, 0) * CFrame.Angles(math.rad(-45), 0, 0))
+									end)
 								end
 							end
 						end
@@ -12848,9 +12960,47 @@ spawn(function()
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
 					end
 				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 0 then
-					replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+					-- vai ate o NPC antes de chamar
+					if IrParaWenlock() then
+						replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "2")
+					end
 				elseif replicated.Remotes.CommF_:InvokeServer("Wenlocktoad", "1") == 1 then
-					warn("Sea Beast Soon")
+					-- V3 do Fishman: matar um SEA BEAST.
+					--
+					-- ANTES: o codigo tinha so  warn("Sea Beast Soon")  —
+					-- a V3 do Fishman NUNCA foi implementada pelo autor do
+					-- Banana. Era um placeholder.
+					--
+					-- O 6V3PullLever implementa via KillSeaBeast (L7728).
+					-- Os nomes de Sea Beast no jogo sao "Sea Beast",
+					-- "Terror Shark" e "Piranha" - varremos os tres.
+					local nomesSeaBeast = { "Sea Beast", "Terror Shark", "Piranha" }
+					local achou = false
+
+					for _, nomeMob in ipairs(nomesSeaBeast) do
+						local mob = GetConnectionEnemies(nomeMob)
+
+						if mob then
+							achou = true
+
+							while true do
+								wait()
+								t9.Kill(mob, _G.Auto_Fish)
+
+								if mob.Humanoid.Health <= 0 then
+									break
+								elseif not mob.Parent or not _G.Auto_Fish then
+									break
+								end
+							end
+						end
+					end
+
+					if not achou then
+						-- nenhum Sea Beast agora: espera na area de spawn
+						-- (o Sea Beast aparece aleatoriamente no mar)
+						task.wait(1)
+					end
 				end
 			end
 		end)

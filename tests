@@ -12311,6 +12311,59 @@ do
 	local RACE_V3_BELI = 2000000
 	local RACE_V3_LEVEL = 1000
 
+	-- ── COLETA DE FLOR DA RACE V2 ──────────────────────────────────────
+	-- CORRIGIDO: o Banana fazia _tp(workspace.Flower2.CFrame) direto.
+	-- No Blox Fruits a flor NAO existe como parte visivel quando ainda
+	-- nao spawnou: a parte fica com Transparency = 1 no lugar fixo.
+	-- Teleportar para ela levava o jogador ao vazio e prendia o tween.
+	--
+	-- O NightRace (script dedicado a races) resolve assim:
+	--     if v7 and v7:IsA("BasePart") and v7.Transparency ~= 1 then
+	-- Replicamos essa checagem aqui.
+	--
+	-- Retorna: true se coletou, false se desistiu.
+	function ColetarFlor(nomeFlor, nomeItem, flagAuto, limite)
+		limite = limite or 25
+
+		local fim = os.clock() + limite
+
+		while os.clock() < fim do
+			-- ja conseguiu o item? entao acabou
+			if GetBP(nomeItem) then
+				return true
+			end
+
+			-- o toggle foi desligado? sai fora
+			if not flagAuto() then
+				return false
+			end
+
+			local flor = workspace:FindFirstChild(nomeFlor)
+			local pronta = flor
+				and flor:IsA("BasePart")
+				and flor.Transparency ~= 1
+				and flor.Transparency < 1
+
+			if pronta then
+				-- flor visivel: vale a pena ir
+				local ok = pcall(function()
+					_tp(flor.CFrame)
+				end)
+
+				if not ok then
+					return false
+				end
+			else
+				-- nao spawnou: espera em vez de teleportar para o nada
+				task.wait(0.5)
+			end
+
+			task.wait(0.25)
+		end
+
+		return GetBP(nomeItem) ~= nil
+	end
+
 	-- le Beli/Level com seguranca
 	function RaceDados()
 		local ok, dados = pcall(function()
@@ -12437,23 +12490,25 @@ do
 						if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 							replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
 						elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 1 then
-							local ok2 = plr.Backpack:FindFirstChild("Flower 1")
+							local ok2 = GetBP("Flower 1")
 
 							if not ok2 then
-								ok2 = plr.Character:FindFirstChild("Flower 1")
+								ok2 = GetBP("Flower 1")
 							end
 
 							if ok2 then
-								local ok = plr.Backpack:FindFirstChild("Flower 2")
+								local ok = GetBP("Flower 2")
 
 								if not ok then
-									ok = plr.Character:FindFirstChild("Flower 2")
+									ok = GetBP("Flower 2")
 								end
 
 								if not ok then
-									_tp(workspace.Flower2.CFrame)
-								elseif not plr.Backpack:FindFirstChild("Flower 3") then
-									if not plr.Character:FindFirstChild("Flower 3") then
+									ColetarFlor("Flower2", "Flower 2", function()
+										return _G.Auto_Mink
+									end)
+								elseif not GetBP("Flower 3") then
+									if not GetBP("Flower 3") then
 										local v971 = GetConnectionEnemies("Swan Pirate")
 
 										if v971 then
@@ -12473,7 +12528,9 @@ do
 									end
 								end
 							else
-								_tp(workspace.Flower1.CFrame)
+								ColetarFlor("Flower1", "Flower 1", function()
+									return _G.Auto_Mink
+								end)
 							end
 						elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 2 then
 							replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
@@ -12514,23 +12571,25 @@ spawn(function()
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
 					elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 1 then
-						local ok2 = plr.Backpack:FindFirstChild("Flower 1")
+						local ok2 = GetBP("Flower 1")
 
 						if not ok2 then
-							ok2 = plr.Character:FindFirstChild("Flower 1")
+							ok2 = GetBP("Flower 1")
 						end
 
 						if ok2 then
-							local ok = plr.Backpack:FindFirstChild("Flower 2")
+							local ok = GetBP("Flower 2")
 
 							if not ok then
-								ok = plr.Character:FindFirstChild("Flower 2")
+								ok = GetBP("Flower 2")
 							end
 
 							if not ok then
-								_tp(workspace.Flower2.CFrame)
-							elseif not plr.Backpack:FindFirstChild("Flower 3") then
-								if not plr.Character:FindFirstChild("Flower 3") then
+								ColetarFlor("Flower2", "Flower 2", function()
+									return _G.Auto_Human
+								end)
+							elseif not GetBP("Flower 3") then
+								if not GetBP("Flower 3") then
 									local v974 = GetConnectionEnemies("Swan Pirate")
 
 									if v974 then
@@ -12538,7 +12597,7 @@ spawn(function()
 											wait()
 											t9.Kill(v974, _G.Auto_Human)
 
-											if plr.Backpack:FindFirstChild("Flower 3") then
+											if GetBP("Flower 3") then
 												break
 											elseif not v974.Parent or v974.Humanoid.Health <= 0 or _G.Auto_Human == false then
 												break
@@ -12550,7 +12609,9 @@ spawn(function()
 								end
 							end
 						else
-							_tp(workspace.Flower1.CFrame)
+							ColetarFlor("Flower1", "Flower 1", function()
+								return _G.Auto_Human
+							end)
 						end
 					elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 2 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
@@ -12650,23 +12711,25 @@ spawn(function()
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
 					elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 1 then
-						local ok2 = plr.Backpack:FindFirstChild("Flower 1")
+						local ok2 = GetBP("Flower 1")
 
 						if not ok2 then
-							ok2 = plr.Character:FindFirstChild("Flower 1")
+							ok2 = GetBP("Flower 1")
 						end
 
 						if ok2 then
-							local ok = plr.Backpack:FindFirstChild("Flower 2")
+							local ok = GetBP("Flower 2")
 
 							if not ok then
-								ok = plr.Character:FindFirstChild("Flower 2")
+								ok = GetBP("Flower 2")
 							end
 
 							if not ok then
-								_tp(workspace.Flower2.CFrame)
-							elseif not plr.Backpack:FindFirstChild("Flower 3") then
-								if not plr.Character:FindFirstChild("Flower 3") then
+								ColetarFlor("Flower2", "Flower 2", function()
+									return _G.Auto_Skypiea
+								end)
+							elseif not GetBP("Flower 3") then
+								if not GetBP("Flower 3") then
 									local v980 = GetConnectionEnemies("Swan Pirate")
 
 									if v980 then
@@ -12674,7 +12737,7 @@ spawn(function()
 											wait()
 											t9.Kill(v980, _G.Auto_Skypiea)
 
-											if plr.Backpack:FindFirstChild("Flower 3") then
+											if GetBP("Flower 3") then
 												break
 											elseif not v980.Parent or v980.Humanoid.Health <= 0 or _G.Auto_Skypiea == false then
 												break
@@ -12686,7 +12749,9 @@ spawn(function()
 								end
 							end
 						else
-							_tp(workspace.Flower1.CFrame)
+							ColetarFlor("Flower1", "Flower 1", function()
+								return _G.Auto_Skypiea
+							end)
 						end
 					elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 2 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")
@@ -12737,23 +12802,25 @@ spawn(function()
 					if replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 0 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "2")
 					elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 1 then
-						local ok2 = plr.Backpack:FindFirstChild("Flower 1")
+						local ok2 = GetBP("Flower 1")
 
 						if not ok2 then
-							ok2 = plr.Character:FindFirstChild("Flower 1")
+							ok2 = GetBP("Flower 1")
 						end
 
 						if ok2 then
-							local ok = plr.Backpack:FindFirstChild("Flower 2")
+							local ok = GetBP("Flower 2")
 
 							if not ok then
-								ok = plr.Character:FindFirstChild("Flower 2")
+								ok = GetBP("Flower 2")
 							end
 
 							if not ok then
-								_tp(workspace.Flower2.CFrame)
-							elseif not plr.Backpack:FindFirstChild("Flower 3") then
-								if not plr.Character:FindFirstChild("Flower 3") then
+								ColetarFlor("Flower2", "Flower 2", function()
+									return _G.Auto_Fish
+								end)
+							elseif not GetBP("Flower 3") then
+								if not GetBP("Flower 3") then
 									local v985 = GetConnectionEnemies("Swan Pirate")
 
 									if v985 then
@@ -12761,7 +12828,7 @@ spawn(function()
 											wait()
 											t9.Kill(v985, _G.Auto_Fish)
 
-											if plr.Backpack:FindFirstChild("Flower 3") then
+											if GetBP("Flower 3") then
 												break
 											elseif not v985.Parent or v985.Humanoid.Health <= 0 or _G.Auto_Fish == false then
 												break
@@ -12773,7 +12840,9 @@ spawn(function()
 								end
 							end
 						else
-							_tp(workspace.Flower1.CFrame)
+							ColetarFlor("Flower1", "Flower 1", function()
+								return _G.Auto_Fish
+							end)
 						end
 					elseif replicated.Remotes.CommF_:InvokeServer("Alchemist", "1") == 2 then
 						replicated.Remotes.CommF_:InvokeServer("Alchemist", "3")

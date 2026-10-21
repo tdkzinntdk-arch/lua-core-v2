@@ -3870,6 +3870,28 @@ local function RaidIslandCenter(locations, index)
     return nil
 end
 
+-- O pivot da ilha pode ficar no meio/embaixo do terreno. Procura uma
+-- superficie fisica acima dele antes de escolher onde aguardar a onda.
+local function RaidIslandLandingPoint(islandCenter)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local exclude = {workspace.Enemies}
+    if LocalPlayer.Character then
+        table.insert(exclude, LocalPlayer.Character)
+    end
+    params.FilterDescendantsInstances = exclude
+    local ray = workspace:Raycast(
+        islandCenter + Vector3.new(0, 260, 0),
+        Vector3.new(0, -460, 0),
+        params
+    )
+    if ray and ray.Instance and ray.Normal.Y > 0.4
+        and math.abs(ray.Position.Y - islandCenter.Y) < 230 then
+        return ray.Position + Vector3.new(0, 18, 0)
+    end
+    return islandCenter + Vector3.new(0, 85, 0)
+end
+
 local function RaidEnemyNearIsland(islandCenter)
     if not islandCenter then return nil end
     local bestEnemy, bestDist = nil, math.huge
@@ -4034,25 +4056,62 @@ AutoDungeon = function()
             SetStatus("raid | defeating enemies | island " .. tostring(raidIslandIndex))
             local humanoid = closestEnemy:FindFirstChildOfClass("Humanoid")
             local root = closestEnemy:FindFirstChild("HumanoidRootPart") or closestEnemy.PrimaryPart
-            local killDeadline = tick() + 28
+            -- Attack() filtra alvos a ATE 35 studs! A antiga raid so
+            -- aproximava quando >62 e tentava atacar desde 75: nessa faixa
+            -- o status mostrava "defeating enemies", mas nenhum golpe acertava.
+            local RAID_HIT_DISTANCE = 29 -- margem para o filtro interno de 35
+            local RAID_APPROACH_TOLERANCE = 10
+            local killDeadline = tick() + 32
             local nextMove = 0
+            local lastDamageAt = tick()
+            local lastHealth = humanoid.Health
+            local consecutiveApproachFailures = 0
             while RaidController.isRaiding and humanoid and humanoid.Parent
                 and humanoid.Health > 0 and root and root.Parent and tick() < killDeadline do
                 local dist = LocalPlayer:DistanceFromCharacter(root.Position)
-                if dist > 62 and tick() >= nextMove then
-                    -- Raid: movimento direto, sem teleportes ou entradas do mundo.
-                    local target = root.Position + Vector3.new(0, 23, 8)
-                    local ok, detail = RaidMoveTo(target, 350, 62)
-                    if not ok then
-                        LogChange("raid_combat_travel", "raid: enemy approach failed (" .. detail .. ")")
+                if humanoid.Health < lastHealth then
+                    lastHealth = humanoid.Health
+                    lastDamageAt = tick()
+                    consecutiveApproachFailures = 0
+                end
+                if dist > RAID_HIT_DISTANCE then
+                    if tick() >= nextMove then
+                        -- Aproxima de VERDADE: offset de ~13 studs do inimigo,
+                        -- tolerancia 10. Nunca usa SmartTween/requestEntrance.
+                        local target = root.Position + Vector3.new(0, 12, 5)
+                        local ok, detail = RaidMoveTo(target, 320, RAID_APPROACH_TOLERANCE)
+                        local after = LocalPlayer:DistanceFromCharacter(root.Position)
+                        if not ok or after > 35 then
+                            consecutiveApproachFailures = consecutiveApproachFailures + 1
+                            LogChange("raid_combat_travel", string.format(
+                                "raid: enemy approach failed (enemy %.0f studs, %s)",
+                                after, tostring(detail)))
+                        else
+                            consecutiveApproachFailures = 0
+                            LogChange("raid_combat_arrival", string.format(
+                                "raid: reached enemy (%.0f studs)", after))
+                        end
+                        nextMove = tick() + (consecutiveApproachFailures >= 3 and 2 or 0.3)
+                    else
+                        task.wait(0.1)
                     end
-                    nextMove = tick() + 0.8
-                elseif dist <= 75 then
+                else
+                    -- Agora so ataca quando o alvo esta ao alcance real.
                     pcall(sethiddenproperty, LocalPlayer, "SimulationRadius", math.huge)
                     EquipWeapon()
-                    Attack()
-                    task.wait(0.13)
-                else
+                    local hitOk, hitErr = pcall(Attack)
+                    if not hitOk then
+                        LogChange("raid_attack_error", "raid: attack failed: " .. tostring(hitErr))
+                    end
+                    -- Se o NPC nao perder vida, reposiciona em vez de ficar
+                    -- parado repetindo ataques que nao estao conectando.
+                    if tick() - lastDamageAt > 7 then
+                        LogChange("raid_no_damage", string.format(
+                            "raid: enemy HP unchanged for 7s (distance %.0f); correcting position", dist))
+                        local correction = root.Position + Vector3.new(0, 8, -4)
+                        RaidMoveTo(correction, 260, 7)
+                        lastDamageAt = tick()
+                    end
                     task.wait(0.15)
                 end
             end
@@ -4060,9 +4119,9 @@ AutoDungeon = function()
                 LogChange("raid_enemy_timeout", "raid: enemy timeout; rechecking island")
             end
         elseif islandCenter and RaidController.isRaiding then
-            -- O pivot de uma ilha nao e necessariamente um ponto de pouso.
-            -- Tolerancia mais ampla evita andar para la e para ca a cada 3s.
-            local destination = islandCenter + Vector3.new(0, 40, 0)
+            -- O centro da ilha pode estar DENTRO do terreno: raycast para
+            -- encontrar uma area mais segura acima da superficie.
+            local destination = RaidIslandLandingPoint(islandCenter)
             local distance = LocalPlayer:DistanceFromCharacter(destination)
             if distance > 160 then
                 if (tick() - lastMoveAttempt) >= 9 or lastMoveIndex ~= raidIslandIndex then

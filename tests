@@ -1260,80 +1260,136 @@ GetQuestPosition = function(questName)
     return nearest
 end
 
+-- A conclusão de Tween.Completed informa apenas que a animação local acabou.
+-- Ela NÃO confirma a posição que o servidor manteve para o personagem.
+-- Quest NPCs exigem proximidade REAL; quando o servidor reposiciona o jogador
+-- após uma viagem longa, aproximamos em trechos curtos e verificáveis.
+local QUEST_NPC_RADIUS = 9
+local function QuestNpcDistance(position)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root or not root.Parent then return math.huge end
+    return (root.Position - position).Magnitude
+end
+
+local function ApproachQuestNpc(position, questName)
+    -- Primeiro usa a rota normal (incluindo as entradas/atalhos por Sea).
+    -- O resultado booleano do tween NAO substitui a distancia real.
+    local travelOk = TweenWithRespawnRetry(position, 350)
+    task.wait(0.35)
+    local remaining = QuestNpcDistance(position)
+    if remaining <= QUEST_NPC_RADIUS then return true end
+
+    warn(string.format(
+        "[Zyon] quest: initial travel %s but npc still %.1f studs away (%s); trying short segments",
+        travelOk and "completed" or "failed/cancelled", remaining, tostring(questName)))
+    LogChange("quest_retry", "quest: correcting route to " .. tostring(questName))
+    SetStatus("quest | correcting route: " .. tostring(questName))
+
+    -- Trechos curtos reduzem os efeitos de reposicionamento do personagem,
+    -- sem forçar teleporte instantaneo e sem mudar o movimento da raid.
+    local overallDeadline = tick() + 75
+    local stalledLegs = 0
+    for leg = 1, 12 do
+        if tick() >= overallDeadline then break end
+        if GetQuestData() then return true end
+        local character, humanoid, root = WaitForAliveCharacter(8)
+        if not character or not humanoid or not root then return false end
+        local origin = root.Position
+        remaining = (origin - position).Magnitude
+        if remaining <= QUEST_NPC_RADIUS then return true end
+
+        local stepDistance = math.min(500, remaining)
+        local destination = origin + (position - origin).Unit * stepDistance
+        local motion = RunTween(destination, nil, 250)
+        if not motion then
+            warn("[Zyon] quest: could not begin movement segment " .. leg)
+            break
+        end
+        local segmentDeadline = math.min(overallDeadline, tick() + stepDistance / 250 + 4)
+        local startDistance = remaining
+        while tick() < segmentDeadline and QuestNpcDistance(position) > QUEST_NPC_RADIUS do
+            if motion.PlaybackState == Enum.PlaybackState.Cancelled then break end
+            if motion.PlaybackState == Enum.PlaybackState.Completed then break end
+            if not character.Parent or humanoid.Health <= 0 then break end
+            task.wait(0.15)
+        end
+        if motion.PlaybackState == Enum.PlaybackState.Playing then
+            pcall(function() motion:Cancel() end)
+        end
+        task.wait(0.25) -- detecta correção/reversão de posição pelo servidor
+        local afterDistance = QuestNpcDistance(position)
+        LogChange("quest_segment", string.format("quest: segment %d, npc distance %.0f", leg, afterDistance))
+        if afterDistance <= QUEST_NPC_RADIUS then return true end
+        if afterDistance >= startDistance - 20 then
+            stalledLegs = stalledLegs + 1
+            warn(string.format("[Zyon] quest: segment %d made no progress (%.1f -> %.1f studs); tween=%s",
+                leg, startDistance, afterDistance, tostring(motion.PlaybackState)))
+            if stalledLegs >= 2 then break end
+        else
+            stalledLegs = 0
+        end
+    end
+    warn(string.format("[Zyon] quest: could not reach npc=%s; remaining=%.1f; %s",
+        tostring(questName), QuestNpcDistance(position), QuestStateDiagnostics()))
+    return false
+end
+
 local function TakeQuest()
-	if (tick() - lastTakeQuest) < 0.75 then
-		return
-	end
-	local q = GetQuest()
+    if tick() < lastTakeQuest then return end
+    local q = GetQuest()
     if q and q.NameQuest then
         LogChange("quest_target", "quest: " .. string.lower(tostring(q.NameQuest)) .. " / " .. string.lower(tostring(q.NameMonster or "unknown")))
     else
         LogChange("quest_target", "quest: no target")
     end
-    if GetQuestData() then
-        return -- never drag player back to quest NPC while mission is active
+    if GetQuestData() then return end
+    if not (q and q.NameQuest and q.ID) then
+        lastTakeQuest = tick() + 3
+        warn("[Zyon] quest: quest selection incomplete")
+        return
     end
-	if q and q.NameQuest and q.ID then
-		local questPos = GetQuestPosition(q.NameQuest)
-        LogChange("quest_travel", questPos and "quest: traveling to npc" or "quest: npc position missing")
-        -- A missing guide position is not a reason to hop servers; hopping can
-        -- interrupt the quest flow and make the character appear elsewhere.
-        if not questPos then
-            warn("[Zyon] Quest NPC location unavailable: " .. tostring(q.NameQuest))
-            lastTakeQuest = tick() + 4
-            return
+
+    local questPos = GetQuestPosition(q.NameQuest)
+    LogChange("quest_travel", questPos and "quest: traveling to npc" or "quest: npc position missing")
+    if not questPos then
+        warn("[Zyon] Quest NPC location unavailable: " .. tostring(q.NameQuest))
+        lastTakeQuest = tick() + 6
+        return
+    end
+    SetStatus("quest | going to npc: " .. tostring(q.NameQuest))
+    -- LOG explicito permite distinguir falha na posicao do GuideModule
+    -- de falha na viagem e nao faz tentativas de StartQuest de 2km longe.
+    local arrived = ApproachQuestNpc(questPos, q.NameQuest)
+    if GetQuestData() then
+        lastTakeQuest = tick() + 1
+        return
+    end
+    local distance = QuestNpcDistance(questPos)
+    if not arrived or distance > QUEST_NPC_RADIUS then
+        warn(string.format("[Zyon] quest: unable to approach npc=%s; distance=%.1f; target=(%.0f,%.0f,%.0f)",
+            tostring(q.NameQuest), distance, questPos.X, questPos.Y, questPos.Z))
+        lastTakeQuest = tick() + 6
+        return
+    end
+
+    LogChange("quest_start", "quest: starting " .. string.lower(tostring(q.NameQuest)))
+    SetStatus("quest | starting " .. string.lower(tostring(q.NameQuest)))
+    local ok, result = pcall(function()
+        return CommF_:InvokeServer("StartQuest", q.NameQuest, q.ID)
+    end)
+    if not ok then
+        warn("[Zyon] Quest StartQuest failed: " .. tostring(result))
+    else
+        -- A quest pode demorar um instante para sincronizar QuestUpdate.
+        local deadline = tick() + 3
+        repeat task.wait(0.2) until GetQuestData() or tick() >= deadline
+        if not GetQuestData() then
+            warn(string.format("[Zyon] quest: StartQuest unconfirmed; npc=%s id=%s distance=%.1f result=%s; %s",
+                tostring(q.NameQuest), tostring(q.ID), QuestNpcDistance(questPos), tostring(result), QuestStateDiagnostics()))
         end
-        SetStatus("quest | going to npc: " .. tostring(q.NameQuest))
-        local traveled = TweenWithRespawnRetry(questPos, 350)
-        task.wait(0.2)
-        if GetQuestData() then
-            lastTakeQuest = tick()
-            return
-        end
-        local distance = LocalPlayer:DistanceFromCharacter(questPos)
-        -- Um Tween 'Completed' pode terminar ainda fora do raio de inicio.
-        -- Fazer a aproximacao final, sem repetir a viagem inteira ate o NPC.
-        if distance > 10 and distance <= 42 then
-            local closeTween = RunTween(questPos, nil, 220)
-            if closeTween then
-                local closeDeadline = tick() + math.clamp(distance / 220 + 2, 2, 5)
-                while tick() < closeDeadline and LocalPlayer:DistanceFromCharacter(questPos) > 10 do
-                    task.wait(0.1)
-                end
-                if LocalPlayer:DistanceFromCharacter(questPos) > 10 then
-                    pcall(function() closeTween:Cancel() end)
-                end
-            end
-            distance = LocalPlayer:DistanceFromCharacter(questPos)
-        end
-        if not traveled and distance > 20 then
-            -- Antes o retorno falso era silencioso e produzia tentativas
-            -- de 30 em 30 segundos sem informar a causa.
-            warn(string.format("[Zyon] quest: travel failed; npc=%s distance=%.1f; %s",
-                tostring(q.NameQuest), distance, QuestStateDiagnostics()))
-        elseif distance > 20 then
-            warn(string.format("[Zyon] quest: still too far from npc; npc=%s distance=%.1f",
-                tostring(q.NameQuest), distance))
-        else
-            -- Mesmo com Completed=Cancelled, podemos ja estar perto do NPC.
-            -- A autorizacao da missao continua sendo feita pelo servidor.
-            LogChange("quest_start", "quest: starting " .. string.lower(tostring(q.NameQuest)))
-            SetStatus("quest | starting " .. string.lower(tostring(q.NameQuest)))
-            local ok, result = pcall(function()
-                return CommF_:InvokeServer("StartQuest", q.NameQuest, q.ID)
-            end)
-            if not ok then
-                warn("[Zyon] Quest StartQuest failed: " .. tostring(result))
-            else
-                task.wait(0.65)
-                if not GetQuestData() then
-                    warn(string.format("[Zyon] quest: StartQuest unconfirmed; npc=%s id=%s distance=%.1f result=%s; %s",
-                        tostring(q.NameQuest), tostring(q.ID), distance, tostring(result), QuestStateDiagnostics()))
-                end
-            end
-        end
-	end
-	lastTakeQuest = tick()
+    end
+    lastTakeQuest = tick() + (GetQuestData() and 1 or 4)
 end
 
 local MobsCakePrince = {
@@ -3262,7 +3318,7 @@ MeleePrices = {
 	},
 	DragonTalon = {
 		Price = {
-			Beli = 2500000,
+			Beli = 3000000, -- custo real no Uzoth (nao 2.5M)
 			Fragments = 5000,
 		},
 		NextLevelRequirement = 400,
@@ -3281,6 +3337,8 @@ Name2Name = {
 	["Electric"] = "Electro",
 	["Dark Step"] = "BlackLeg",
 	["Dragon Breath"] = "DragonClaw",
+    ["Dragon Claw"] = "DragonClaw",
+    DragonBreath = "DragonClaw",
 }
 
 -- Nomes reais das ferramentas no inventario. As chaves internas usadas pelo
@@ -3300,41 +3358,61 @@ local MeleeToolNames = {
 local function GetMeleeToolName(key)
 	return MeleeToolNames[key] or key:gsub("(%l)(%u)", "%1 %2")
 end
+-- Um estilo com maestria zero pode JA estar comprado. O inventario de
+-- maestrias informa posse separadamente do numero de niveis de maestria.
+local MeleeOwned = {}
 local lastMeleeDataCheck = 0
-local function CheckMeleeMastery()
-	local now = tick()
-	if (now - lastMeleeDataCheck) < 10 then
-		return
-	end
-	lastMeleeDataCheck = now
+local function CheckMeleeMastery(force)
+    local now = tick()
+    if not force and CheckedMelee and (now - lastMeleeDataCheck) < 10 then
+        return true
+    end
+    local success, data = pcall(function() return IRS:GetItems(KEYS.MASTERY) end)
+    if not success or type(data) ~= "table" then
+        LogChange("melee_data", "melee: unable to verify owned styles; avoiding risky purchases")
+        return false
+    end
+    -- So substitui informacao quando a leitura inteira funciona.
+    local owned = {}
+    local levels = {}
+    for _, record in data do
+        local ok, matched = pcall(function() return MATCH(record.ItemId) end)
+        local item = ok and matched and matched._ok
+        if item and item.Index and item.Display and item.Display.Category == "Fighting Style" then
+            local storageKey = item.Index.StorageKey
+            if type(storageKey) == "string" then
+                local key = Name2Name[storageKey] or storageKey:gsub(" ", "")
+                if MeleeData[key] ~= nil then
+                    owned[key] = true -- inclusive com record.Value == 0
+                    levels[key] = tonumber(record.Value) or 0
+                end
+            end
+        end
+    end
+    for key, value in levels do MeleeData[key] = value end
+    for key in owned do MeleeOwned[key] = true end
+    CheckedMelee = true
+    lastMeleeDataCheck = now
+    LogChange("melee_data", "melee: ownership and mastery verified")
+    return true
+end
 
-	if not CheckedMelee then
-        LogChange("melee_data", "melee: checking data")
-	end
+local function OwnsMeleeStyle(key)
+    if MeleeOwned[key] or (MeleeData[key] or 0) > 0 then return true end
+    local displayName = GetMeleeToolName(key)
+    if HasItem(displayName) then return true end
+    -- Nome antigo do Dragon Breath aparece em alguns clientes/codigos.
+    if key == "DragonClaw" and HasItem("Dragon Claw") then return true end
+    return false
+end
 
-	local success = pcall(function()
-		local data = IRS:GetItems(KEYS.MASTERY)
-		for _, v in data do
-			local matched = MATCH(v.ItemId)
-			local item = matched and matched._ok
-			if item and item.Index and item.Display then
-				local n = item.Index.StorageKey
-				if item.Display.Category == "Fighting Style" and n then
-					local key = Name2Name[n] or n:gsub(" ", "")
-					if MeleeData[key] ~= nil then
-						MeleeData[key] = tonumber(v.Value) or MeleeData[key]
-					end
-				end
-			end
-		end
-	end)
-
-	if success then
-		CheckedMelee = true
-        LogChange("melee_data", "melee: data loaded")
-    else
-        LogChange("melee_data", "melee: data load failed")
-	end
+-- Guarda a tentativa entre reexecucoes no mesmo cliente: o mesmo estilo nao
+-- pode consumir fragmentos repetidamente quando a atualizacao do inventario
+-- demora, falha ou o NPC devolve uma resposta inesperada.
+local MeleePurchaseGuard = getgenv().__ZyonMeleePurchaseGuard
+if type(MeleePurchaseGuard) ~= "table" then
+    MeleePurchaseGuard = {}
+    getgenv().__ZyonMeleePurchaseGuard = MeleePurchaseGuard
 end
 
 local CheckCanDungeon, AutoDungeon
@@ -3393,17 +3471,36 @@ local GetMeleeLogics = {
 		CommF_:InvokeServer("BuyElectricClaw")
 	end,
 	DragonTalon = function()
-		Travel.Sea3()
-		repeat
-			task.wait()
-			FarmBoneLogic()
-			if GetMaterial("Bones") >= 50 then
-				CommF_:InvokeServer("Bones", "Buy", 1, 1)
-			end
-		until HasItem("Fire Essence")
-		TweenToMeleeBuyer("DragonTalon")
-		CommF_:InvokeServer("BuyDragonTalon", true)
-		CommF_:InvokeServer("BuyDragonTalon")
+        -- Nao atravessa Sea2->Sea3, nao roda loop infinito de ossos e nao
+        -- tenta comprar Dragon Talon sem todos os pre-requisitos.
+        if not World.Sea3() or OwnsMeleeStyle("DragonTalon") then return false end
+        if (MeleeData.DragonClaw or 0) < 400 then
+            LogChange("dragon_talon_gate", "melee: dragon talon needs dragon breath mastery 400")
+            return false
+        end
+        if not HasItem("Fire Essence") then
+            LogChange("dragon_talon_gate", "melee: dragon talon waiting for fire essence")
+            return false
+        end
+        if LocalPlayer.Data.Beli.Value < 3000000 or LocalPlayer.Data.Fragments.Value < 5000 then
+            LogChange("dragon_talon_gate", "melee: dragon talon waiting for 3M beli / 5000 fragments")
+            return false
+        end
+        if MeleePurchaseGuard.DragonTalon then return false end
+        if not CheckMeleeMastery(true) or OwnsMeleeStyle("DragonTalon") then return false end
+        if not TweenToMeleeBuyer("DragonTalon") then return false end
+        -- O primeiro argumento true consulta disponibilidade; NAO confirma compra.
+        local checkOk, check = pcall(function() return CommF_:InvokeServer("BuyDragonTalon", true) end)
+        if not checkOk or not HasItem("Fire Essence") then
+            LogChange("dragon_talon_gate", "melee: talon prerequisites could not be verified")
+            return false
+        end
+        MeleePurchaseGuard.DragonTalon = true
+        local ok, result = pcall(function() return CommF_:InvokeServer("BuyDragonTalon") end)
+        task.wait(1)
+        CheckMeleeMastery(true)
+        LogChange("dragon_talon_purchase", "melee: talon attempt=" .. tostring(ok) .. " response=" .. tostring(result) .. " owned=" .. tostring(OwnsMeleeStyle("DragonTalon")))
+        return ok
 	end,
 }
 
@@ -3427,9 +3524,8 @@ local function MeleeKaitunLogic()
 	else
 		return
 	end
-	if not CheckedMelee then
-		CheckMeleeMastery()
-	end
+    -- Atualiza posse/maestria periodicamente, inclusive depois de compras.
+    CheckMeleeMastery()
 	for _, v in {"BlackLeg", "Electro", "FishmanKarate"} do
 		-- Electric deve ser comprado no Sea 1; no Sea 2/3 nao bloqueie o farm tentando compra-lo.
 		if v == "Electro" and not World.Sea1() then
@@ -3474,6 +3570,53 @@ local function MeleeKaitunLogic()
 	if not World.Sea1() then
 		for _, v in {"DragonClaw", "Superhuman", "DeathStep", "SharkmanKarate"} do
 			local realName = GetMeleeToolName(v)
+            if v == "DragonClaw" then
+                -- Dragon Breath: EVITAR COBRAR 1.500 FRAGMENTOS REPETIDAMENTE.
+                -- Ter maestria zero e nao ter a Tool equipada NAO significa
+                -- que o Sabi ainda nao vendeu o estilo.
+                if (MeleeData.DragonClaw or 0) < 400 then
+                    if OwnsMeleeStyle("DragonClaw") then
+                        LogChange("dragon_breath", "melee: dragon breath already owned; no repurchase")
+                        -- O farm normal continua. Nunca chamar BlackbeardReward
+                        -- para "reequipar" a cada ciclo.
+                        return
+                    end
+                    if not CheckedMelee then
+                        LogChange("dragon_breath", "melee: dragon breath ownership not verified; keeping fragments")
+                        return
+                    end
+                    if LocalPlayer.Data.Fragments.Value < 1500 then
+                        if CheckCanDungeon() and LocalPlayer.Data.Level.Value >= 1250 then
+                            AutoDungeon()
+                            return true
+                        end
+                        return
+                    end
+                    if MeleePurchaseGuard.DragonClaw then
+                        LogChange("dragon_breath", "melee: dragon breath purchase already attempted; preserving fragments")
+                        return
+                    end
+                    if not TweenToMeleeBuyer("DragonClaw") then
+                        LogChange("dragon_breath", "melee: sabi unreachable; not buying")
+                        return true
+                    end
+                    -- Ultima confirmacao de posse antes de qualquer compra.
+                    if not CheckMeleeMastery(true) or OwnsMeleeStyle("DragonClaw") then return end
+                    MeleePurchaseGuard.DragonClaw = true
+                    local fragmentsBefore = LocalPlayer.Data.Fragments.Value
+                    local ok, result = pcall(function()
+                        return CommF_:InvokeServer("BlackbeardReward", "DragonClaw", "2")
+                    end)
+                    task.wait(1)
+                    CheckMeleeMastery(true)
+                    LogChange("dragon_breath_buy", string.format(
+                        "melee: dragon breath attempted once; ok=%s result=%s fragments=%d->%d owned=%s",
+                        tostring(ok), tostring(result), fragmentsBefore,
+                        LocalPlayer.Data.Fragments.Value, tostring(OwnsMeleeStyle("DragonClaw"))))
+                    return true
+                end
+                continue
+            end
 			if (MeleeData[v] or 0) < 400 then
 				local hasEnoughEco = (
 					(MeleePrices[v].Price.Beli == nil) or (LocalPlayer.Data.Beli.Value >= MeleePrices[v].Price.Beli)
@@ -3492,7 +3635,7 @@ local function MeleeKaitunLogic()
 						if v == "Superhuman" then
 							CommF_:InvokeServer("Buy" .. v)
 						else
-							CommF_:InvokeServer("BlackbeardReward", "DragonClaw", "2")
+                            -- DragonClaw handled exclusively by guarded branch.
 						end
 					end
 				elseif (MeleeData[v] or 0) == 0 and (MeleePrices[v].Price.Fragments and (LocalPlayer.Data.Fragments.Value < MeleePrices[v].Price.Fragments)) and CheckCanDungeon() then
@@ -3506,17 +3649,37 @@ local function MeleeKaitunLogic()
 					if not TweenToMeleeBuyer(v) then
 						break
 					end
-					if v == "DragonClaw" then
-						CommF_:InvokeServer("BlackbeardReward", "DragonClaw", "2")
-					else
-						CommF_:InvokeServer("Buy" .. v)
-					end
+                    -- DragonClaw handled by guarded branch above.
+                    CommF_:InvokeServer("Buy" .. v)
 				end
 				return
 			end
 		end
 		for _, v in {"ElectricClaw", "DragonTalon", "Godhuman"} do
+            -- Todos sao objetivos de Sea3. Nao desviar a conta Sea2 da raid.
+            if not World.Sea3() then break end
 			local realName = GetMeleeToolName(v)
+            if v == "DragonTalon" then
+                -- Never buy or grind for Talon if Dragon Breath is not yet at 400.
+                if OwnsMeleeStyle("DragonTalon") then
+                    if (MeleeData.DragonTalon or 0) < 400 then return end
+                    continue
+                end
+                if (MeleeData.DragonClaw or 0) < 400 or not OwnsMeleeStyle("DragonClaw") then
+                    LogChange("dragon_talon_wait", "melee: train dragon breath to mastery 400 before dragon talon")
+                    return
+                end
+                if not HasItem("Fire Essence") then
+                    LogChange("dragon_talon_wait", "melee: waiting for fire essence (no fragment purchases)")
+                    return
+                end
+                if LocalPlayer.Data.Beli.Value < 3000000 or LocalPlayer.Data.Fragments.Value < 5000 then
+                    LogChange("dragon_talon_wait", "melee: waiting for talon resources")
+                    return
+                end
+                GetMeleeLogics.DragonTalon()
+                return -- if buyer was not reached, do not block normal farming
+            end
 			if (MeleeData[v] or 0) < 400 then
 				local hasEnoughEco = (
 					(MeleePrices[v].Price.Beli == nil) or (LocalPlayer.Data.Beli.Value >= MeleePrices[v].Price.Beli)
@@ -3553,7 +3716,7 @@ local function MeleeKaitunLogic()
 					end
 				elseif (MeleeData[v] or 0) == 0 and not hasEnoughEco then
                     LogChange("melee_wait", "melee: waiting for " .. string.lower(realName) .. " resources")
-				elseif (MeleeData[v] or 0) > 0 and not Character:FindFirstChild(realName) and not LocalPlayer.Backpack:FindFirstChild(realName) then
+                elseif v ~= "DragonTalon" and (MeleeData[v] or 0) > 0 and not Character:FindFirstChild(realName) and not LocalPlayer.Backpack:FindFirstChild(realName) then
 					if not TweenToMeleeBuyer(v) then
 						break
 					end
@@ -3627,8 +3790,9 @@ CheckCanDungeon = function()
 end
 
 local RaidController = {
-	isRaiding = false,
+    isRaiding = false,
     startedAt = 0,
+    currentIsland = 1, -- mantem o progresso mesmo se AutoDungeon for chamado novamente
 }
 RaidController.RaidState_Connection = nil
 if World.Sea2() or World.Sea3() then
@@ -3641,6 +3805,7 @@ if World.Sea2() or World.Sea3() then
                 if a == "StartTimer" then
                     RaidController.isRaiding = true
                     RaidController.startedAt = tick()
+                    RaidController.currentIsland = 1
                     LogChange("raid_signal", "raid: StartTimer received; raid active")
                 elseif type(a) == "string" and table.find({
                     "StopTimer", "EndTimer", "TimerEnded", "RaidEnded", "RaidEnd",
@@ -3666,6 +3831,63 @@ local function KillAura(distance)
 			end
 		end
 	end
+end
+
+-- Movimentos de raid NAO devem usar SmartTween/requestEntrance: esses atalhos
+-- sao validos para o mundo aberto, mas podem tirar o jogador da instancia
+-- da raid e provocar o teleporte para muito longe relatado pelo usuario.
+local function RaidMoveTo(position, speed, threshold)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return false, "no character" end
+    threshold = threshold or 125
+    local before = (root.Position - position).Magnitude
+    if before <= threshold then return true, "already near" end
+    local tween = RunTween(position, nil, speed or 350) -- sem SmartTween!
+    if not tween then return false, "no tween" end
+    local deadline = tick() + math.clamp(before / math.max(speed or 350, 1) + 3, 5, 40)
+    while RaidController.isRaiding and tick() < deadline do
+        if not root.Parent or not char.Parent then break end
+        if (root.Position - position).Magnitude <= threshold then
+            -- Cancela apenas a instancia criada por ESTA chamada, sem mexer
+            -- em um tween novo que outra rotina possa ter iniciado.
+            pcall(function() tween:Cancel() end)
+            return true, "reached"
+        end
+        local state = tween.PlaybackState
+        if state == Enum.PlaybackState.Cancelled or state == Enum.PlaybackState.Completed then break end
+        task.wait(0.2)
+    end
+    local after = root.Parent and (root.Position - position).Magnitude or math.huge
+    return after <= threshold, string.format("distance %.0f -> %.0f", before, after)
+end
+
+local function RaidIslandCenter(locations, index)
+    local island = locations and locations:FindFirstChild("Island " .. tostring(index))
+    if not island then return nil end
+    if island:IsA("BasePart") then return island.Position end
+    if island:IsA("Model") then return island:GetPivot().Position end
+    return nil
+end
+
+local function RaidEnemyNearIsland(islandCenter)
+    if not islandCenter then return nil end
+    local bestEnemy, bestDist = nil, math.huge
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    for _, enemy in workspace.Enemies:GetChildren() do
+        local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+        local part = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+        if humanoid and humanoid.Health > 0 and part
+           and (part.Position - islandCenter).Magnitude < 600 then
+            local playerDist = (part.Position - root.Position).Magnitude
+            if playerDist < bestDist then
+                bestEnemy, bestDist = enemy, playerDist
+            end
+        end
+    end
+    return bestEnemy, bestDist
 end
 
 AutoDungeon = function()
@@ -3765,104 +3987,120 @@ AutoDungeon = function()
         LogChange("raid_state", RaidController.isRaiding and "raid: started" or "raid: join timed out")
         SetStatus(RaidController.isRaiding and "raid | started" or "raid | join timed out")
 		task.wait(0.5)
-        local raidIslandIndex = 1
-        local lastEnemySeen = tick()
-        while RaidController.isRaiding do
-            -- Failsafe apenas se o servidor nao emitir nenhum sinal terminal.
-            -- Raids normais tem duracao menor; nunca abandonar por onda/ilha.
-            if RaidController.startedAt > 0 and tick() - RaidController.startedAt > 16 * 60 then
-                warn("[Zyon] raid: safety timeout (16min) without explicit end; rechecking progression")
-                RaidController.isRaiding = false
-                break
-            end
-            -- Segue Ilha 1 -> 5 em ordem, sem saltar direto para a ultima ilha
-            -- simplesmente porque ela ja apareceu no mapa.
-            local worldOrigin = workspace:FindFirstChild("_WorldOrigin")
-            local locations = worldOrigin and worldOrigin:FindFirstChild("Locations")
-            local activeIsland = locations and locations:FindFirstChild("Island " .. raidIslandIndex)
-            if not activeIsland and locations then
-                for i = raidIslandIndex, 5 do
-                    local candidate = locations:FindFirstChild("Island " .. i)
-                    if candidate then
-                        raidIslandIndex, activeIsland = i, candidate
-                        break
-                    end
-                end
-            end
+    end -- fim da preparacao/chamada; uma raid JA ativa vai direto para o combate
+    if not RaidController.isRaiding then
+        LogChange("raid_state", "raid: no active instance after summon")
+        return
+    end
 
-            local nearestEnemy, nearestDist = nil, math.huge
-            for _, enemy in workspace.Enemies:GetChildren() do
-                local humanoid = enemy:FindFirstChildOfClass("Humanoid")
-                local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
-                if humanoid and humanoid.Health > 0 and root then
-                    local dist = LocalPlayer:DistanceFromCharacter(root.Position)
-                    if dist <= 2000 and dist < nearestDist then
-                        nearestEnemy, nearestDist = enemy, dist
-                    end
-                end
-            end
+    -- Apos retomar AutoDungeon, continua na ilha atual, sem recomecar pela 1.
+    local raidIslandIndex = math.clamp(RaidController.currentIsland or 1, 1, 5)
+    local lastEnemySeen = tick()
+    local lastMoveAttempt = 0
+    local lastMoveIndex = 0
+    local consecutiveMoveFailures = 0
+    while RaidController.isRaiding do
+        if RaidController.startedAt > 0 and tick() - RaidController.startedAt > 16 * 60 then
+            warn("[Zyon] raid: timeout de 16min sem encerramento; voltando ao ciclo")
+            RaidController.isRaiding = false
+            break
+        end
 
-            if nearestEnemy then
+        local worldOrigin = workspace:FindFirstChild("_WorldOrigin")
+        local locations = worldOrigin and worldOrigin:FindFirstChild("Locations")
+        local islandCenter = RaidIslandCenter(locations, raidIslandIndex)
+        local closestEnemy, closestDist = RaidEnemyNearIsland(islandCenter)
+        if closestEnemy then
+            lastEnemySeen = tick()
+        elseif islandCenter and raidIslandIndex < 5
+            and LocalPlayer:DistanceFromCharacter(islandCenter) <= 230
+            and tick() - lastEnemySeen >= 7 then
+            -- A ilha seguinte precisa EXISTIR e ser razoavelmente proxima;
+            -- nao inferimos progresso so pela ausencia temporaria de mobs.
+            local nextCenter = RaidIslandCenter(locations, raidIslandIndex + 1)
+            if nextCenter and (nextCenter - islandCenter).Magnitude <= 4000 then
+                raidIslandIndex = raidIslandIndex + 1
+                RaidController.currentIsland = raidIslandIndex
+                islandCenter = nextCenter
+                closestEnemy, closestDist = RaidEnemyNearIsland(islandCenter)
                 lastEnemySeen = tick()
-            elseif activeIsland and locations and raidIslandIndex < 5
-                and LocalPlayer:DistanceFromCharacter(activeIsland:GetPivot().Position) <= 120
-                and tick() - lastEnemySeen >= 4 then
-                local nextIsland = locations:FindFirstChild("Island " .. (raidIslandIndex + 1))
-                if nextIsland then
-                    raidIslandIndex = raidIslandIndex + 1
-                    activeIsland = nextIsland
-                    lastEnemySeen = tick()
-                    LogChange("raid_island", "raid: advancing to island " .. raidIslandIndex)
-                end
+                lastMoveAttempt = 0
+                consecutiveMoveFailures = 0
+                LogChange("raid_island", "raid: advancing to island " .. tostring(raidIslandIndex))
             end
+        end
 
-            if nearestEnemy then
-                SetStatus("raid | defeating enemies | island " .. tostring(raidIslandIndex))
-                local humanoid = nearestEnemy:FindFirstChildOfClass("Humanoid")
-                local root = nearestEnemy:FindFirstChild("HumanoidRootPart") or nearestEnemy.PrimaryPart
-                local killDeadline = tick() + 25
-                local nextMove = 0
-                while RaidController.isRaiding and humanoid and humanoid.Parent and humanoid.Health > 0
-                    and root and root.Parent and tick() < killDeadline do
-                    local dist = LocalPlayer:DistanceFromCharacter(root.Position)
-                    if dist > 48 and tick() >= nextMove then
-                        Tween(root.Position + Vector3.new(0, 25, 8), 350)
-                        nextMove = tick() + math.clamp(dist / 350, 0.6, 4)
-                    elseif dist <= 65 then
-                        pcall(sethiddenproperty, LocalPlayer, "SimulationRadius", math.huge)
-                        EquipWeapon()
-                        Attack()
+        if closestEnemy and RaidController.isRaiding then
+            SetStatus("raid | defeating enemies | island " .. tostring(raidIslandIndex))
+            local humanoid = closestEnemy:FindFirstChildOfClass("Humanoid")
+            local root = closestEnemy:FindFirstChild("HumanoidRootPart") or closestEnemy.PrimaryPart
+            local killDeadline = tick() + 28
+            local nextMove = 0
+            while RaidController.isRaiding and humanoid and humanoid.Parent
+                and humanoid.Health > 0 and root and root.Parent and tick() < killDeadline do
+                local dist = LocalPlayer:DistanceFromCharacter(root.Position)
+                if dist > 62 and tick() >= nextMove then
+                    -- Raid: movimento direto, sem teleportes ou entradas do mundo.
+                    local target = root.Position + Vector3.new(0, 23, 8)
+                    local ok, detail = RaidMoveTo(target, 350, 62)
+                    if not ok then
+                        LogChange("raid_combat_travel", "raid: enemy approach failed (" .. detail .. ")")
                     end
+                    nextMove = tick() + 0.8
+                elseif dist <= 75 then
+                    pcall(sethiddenproperty, LocalPlayer, "SimulationRadius", math.huge)
+                    EquipWeapon()
+                    Attack()
+                    task.wait(0.13)
+                else
                     task.wait(0.15)
                 end
-                if humanoid and humanoid.Parent and humanoid.Health > 0 then
-                    LogChange("raid_enemy_timeout", "raid: enemy timeout; reevaluating")
-                end
-            elseif activeIsland and RaidController.isRaiding then
-                -- Apenas se desloca quando esta efetivamente longe da ilha atual.
-                -- Antes o loop voltava incessantemente para a mesma coordenada.
-                local destination = activeIsland:GetPivot().Position + Vector3.new(0, 42, 0)
-                if LocalPlayer:DistanceFromCharacter(destination) > 95 then
-                    SetStatus("raid | moving to island " .. tostring(raidIslandIndex))
-                    local move = Tween(destination, 350)
-                    if move then
-                        local deadline = tick() + 8
-                        while RaidController.isRaiding and tick() < deadline
-                            and LocalPlayer:DistanceFromCharacter(destination) > 95 do
-                            task.wait(0.2)
+            end
+            if humanoid and humanoid.Parent and humanoid.Health > 0 then
+                LogChange("raid_enemy_timeout", "raid: enemy timeout; rechecking island")
+            end
+        elseif islandCenter and RaidController.isRaiding then
+            -- O pivot de uma ilha nao e necessariamente um ponto de pouso.
+            -- Tolerancia mais ampla evita andar para la e para ca a cada 3s.
+            local destination = islandCenter + Vector3.new(0, 40, 0)
+            local distance = LocalPlayer:DistanceFromCharacter(destination)
+            if distance > 160 then
+                if (tick() - lastMoveAttempt) >= 9 or lastMoveIndex ~= raidIslandIndex then
+                    lastMoveAttempt = tick()
+                    lastMoveIndex = raidIslandIndex
+                    if distance > 7000 then
+                        warn(string.format("[Zyon] raid: island %d destination %.0f studs away; waiting for map to load", raidIslandIndex, distance))
+                        SetStatus("raid | waiting for island position")
+                        task.wait(2)
+                    else
+                        SetStatus("raid | moving to island " .. tostring(raidIslandIndex))
+                        local ok, detail = RaidMoveTo(destination, 350, 160)
+                        if not ok then
+                            consecutiveMoveFailures = consecutiveMoveFailures + 1
+                            warn(string.format("[Zyon] raid: island %d movement failed (%s), attempt %d", raidIslandIndex, detail, consecutiveMoveFailures))
+                            if consecutiveMoveFailures >= 2 then
+                                SetStatus("raid | movement blocked; waiting for next wave")
+                                task.wait(5)
+                            end
+                        else
+                            consecutiveMoveFailures = 0
+                            LogChange("raid_arrival", "raid: reached island " .. tostring(raidIslandIndex))
                         end
                     end
                 else
-                    SetStatus("raid | waiting for next wave")
-                    task.wait(0.4)
+                    SetStatus("raid | waiting for island movement cooldown")
+                    task.wait(0.35)
                 end
             else
-                SetStatus("raid | waiting for island")
+                SetStatus("raid | waiting for next wave")
                 task.wait(0.4)
             end
-            task.wait(0.1)
+        else
+            SetStatus("raid | waiting for island to load")
+            task.wait(0.5)
         end
-	end
+        task.wait(0.1)
+    end
 	 task.wait(5)
     LogChange("raid_state", "raid: cycle ended")
 end
@@ -4261,13 +4499,10 @@ task.spawn(function()
 						CommF_:InvokeServer("BuySharkmanKarate")
 					end
 				end
-			elseif World.Sea3() then
-				if HasItem("Fire Essence") and CommF_:InvokeServer("BuyDragonTalon", true):find("your") then
-					if TweenToMeleeBuyer("DragonTalon") then
-						CommF_:InvokeServer("BuyDragonTalon", true)
-						CommF_:InvokeServer("BuyDragonTalon")
-					end
-				end
+            elseif World.Sea3() then
+                -- Dragon Talon e tratado apenas na rotina de estilos,
+                -- com verificacao de posse, Fire Essence, 400 mastery,
+                -- 3M Beli e 5k fragmentos. Nao comprar daqui novamente.
 			end
 			if LocalPlayer.Data.Level.Value == MaxLevel then
 				pcall(FarmKataLogic)

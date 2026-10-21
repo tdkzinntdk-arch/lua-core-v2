@@ -4890,17 +4890,26 @@ local FruitSpinNext = tick() + 15
 local LastFruitScan = 0
 local CachedFruit = nil
 
+-- Fruta DROPADA e uma Tool fisica; NPCs/lojas sao Models, nao frutas.
+-- Antes, qualquer Model com "fruit" no nome era coletavel, incluindo
+-- "Blox Fruit Dealer": o kaitun perdia 55s tentando pegar o NPC.
 local function IsWorldFruit(object)
     if not object or not object.Parent or not object:IsDescendantOf(workspace) then return false end
-    if not (object:IsA("Tool") or object:IsA("Model")) then return false end
+    if not object:IsA("Tool") then return false end
     local name = object.Name:lower()
-    local isFruit = name:find("fruit", 1, true) ~= nil
-    if object:IsA("Tool") then
-        isFruit = isFruit or tostring(object.ToolTip):lower() == "blox fruit"
+    local tooltip = tostring(object.ToolTip):lower()
+    if name:find("dealer", 1, true) or name:find("zioles", 1, true)
+        or name:find("gacha", 1, true) or name:find("shop", 1, true)
+        or name:find("notifier", 1, true) then
+        return false
     end
+    -- Nao confundir NPC, botao de menu ou decoracao com fruta fisica.
+    local isFruit = tooltip == "blox fruit"
+        or name == "blox fruit"
+        or name:match("%f[%a]fruit%f[%A]") ~= nil
     if not isFruit then return false end
-    local root = object:FindFirstChild("Handle") or object:FindFirstChildWhichIsA("BasePart", true)
-    if not root then return false end
+    local handle = object:FindFirstChild("Handle")
+    if not handle or not handle:IsA("BasePart") then return false end
     local ancestor = object.Parent
     while ancestor and ancestor ~= workspace do
         if ancestor == workspace.Enemies or ancestor == workspace.Map
@@ -4908,7 +4917,7 @@ local function IsWorldFruit(object)
             return false
         end
         if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
-            return false -- nao roubar item equipado de outro jogador
+            return false -- nao tentar coletar objetos de NPCs e jogadores
         end
         ancestor = ancestor.Parent
     end
@@ -4951,7 +4960,8 @@ end
 
 -- Aviso rapido sobre frutas que aparecem a meio caminho de outro farm.
 workspace.DescendantAdded:Connect(function(obj)
-    if (obj:IsA("Tool") or obj:IsA("Model")) and obj.Name:lower():find("fruit", 1, true) then
+    if obj:IsA("Tool") and (obj.Name:lower():find("fruit", 1, true)
+        or tostring(obj.ToolTip):lower() == "blox fruit") then
         task.defer(function()
             if IsWorldFruit(obj) then
                 CachedFruit = obj
@@ -5054,7 +5064,7 @@ local function RollFruitOnce()
     -- DLCBoxData e consulta, NAO compra a fruta!
     FruitSpinNext = tick() + 300 -- anti-duplicacao mesmo com resposta desconhecida
     SetStatus("fruits | rolling at zioles")
-    LogChange("fruit_spin", "fruit: attempting Cousin/Buy (automatic roll)")
+    LogChange("fruit_spin", "fruit: Zioles GACHA (random fruit), sending Cousin/Buy; NOT Blox Fruit Dealer")
     local previousMoney = LocalPlayer.Data.Beli.Value
     local ok, response = pcall(function()
         return CommF_:InvokeServer("Cousin", "Buy")
@@ -5067,10 +5077,10 @@ local function RollFruitOnce()
     local spent = math.max(0, previousMoney - LocalPlayer.Data.Beli.Value)
     if spent > 0 then
         FruitSpinNext = tick() + math.max(7200, tonumber(Config.FruitSpinInterval) or 7200)
-        LogChange("fruit_spin", string.format("fruit: gacha purchase confirmed (Beli spent: %d); next roll in >=2h", spent))
+        LogChange("fruit_spin", string.format("fruit: Zioles GACHA payment confirmed (Beli spent: %d); next roll in >=2h", spent))
         return
     end
-    warn("[Zyon] fruit: gacha returned " .. tostring(response) .. " but payment not confirmed; retrying later")
+    warn("[Zyon] fruit: Zioles gacha returned " .. tostring(response) .. "; Beli did not change, purchase NOT confirmed; retrying later")
 end
 
 local CASTLE_EVENT_POS = Vector3.new(-5000, 350, -3035)
@@ -5259,6 +5269,16 @@ end
 local function ChoosePriority()
     local fruit = FindGroundFruit()
     if fruit then return "FRUIT_PICKUP", fruit end
+    -- Nao cancelar o InvokeServer do gacha no mesmo segundo que foi enviado!
+    -- FruitSpinNext muda ANTES da resposta; sem esta protecao, o controlador
+    -- trocava FRUIT_ROLL para LEVEL e cancelava o worker em pleno Cousin/Buy.
+    if PriorityMode == "FRUIT_ROLL" and PriorityWorker
+        and coroutine.status(PriorityWorker) ~= "dead" then
+        if tick() - PriorityWorkerStarted < 25 then
+            return "FRUIT_ROLL", nil
+        end
+        warn("[Zyon] fruit: Zioles gacha timed out after 25s; preserving 5min retry delay")
+    end
     if FruitSpinDue() then return "FRUIT_ROLL", nil end
     local event, enemy = FindEventEnemy()
     if event == "FACTORY" then return "EVENT_FACTORY", enemy end

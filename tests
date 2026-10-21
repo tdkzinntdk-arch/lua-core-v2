@@ -1,7 +1,7 @@
 -- Reliability patch applied 2026-10-20.
 -- Scope: bounded waits, Tween speed forwarding, forced-kick removal, and removal
 -- of __namecall interception that suppressed integrity-related remote calls.
--- Factory (Sea2) e Pirate Castle (Sea3) agora funcionam como eventos de prioridade 2.
+-- Factory, Pirate Castle e raid bosses ativos agora funcionam como eventos de prioridade 2.
 getgenv().Configs = {
 	Team = "Pirates",
 	FixLag = false,
@@ -19,9 +19,12 @@ getgenv().Configs = {
 	AutoFruitStore = true,           -- guarda frutas fisicas sem comer
 	FruitSpinInterval = 7200,       -- cooldown base: 2 horas
 	FruitSpinReserveBeli = 250000,  -- preserva algum Beli para farm
-	AutoEventRaids = true,          -- Factory (Sea2) e Pirate Castle (Sea3)
+	AutoEventRaids = true,          -- Factory (Sea2), Pirate Castle (Sea3) e bosses ativos
+	AutoRaidBossEvents = true,     -- Darkbeard, Cake Prince, Dough King e rip_indra: apenas se surgirem
 	AutoNormalRaids = false,        -- raids de microchip nao sao raid events
-	EnableSideProgression = false   -- prioridades EXATAS: fruta > evento > nivel
+	EnableSideProgression = false,  -- prioridades EXATAS: fruta > evento > nivel
+	AutoFarmSetHome = true,        -- marca spawn somente ao chegar de verdade na ilha da quest
+	AutoFarmUseHome = true         -- volta ao spawn marcado se ele for da ilha-alvo
 }
 
 -- ===== CORRIGIDO (Zyon) =====
@@ -49,9 +52,12 @@ do
 	AutoFruitStore = true,           -- guarda frutas fisicas sem comer
 	FruitSpinInterval = 7200,       -- cooldown base: 2 horas
 	FruitSpinReserveBeli = 250000,  -- preserva algum Beli para farm
-	AutoEventRaids = true,          -- Factory (Sea2) e Pirate Castle (Sea3)
+	AutoEventRaids = true,          -- Factory (Sea2), Pirate Castle (Sea3) e bosses ativos
+	AutoRaidBossEvents = true,     -- Darkbeard, Cake Prince, Dough King e rip_indra: apenas se surgirem
 	AutoNormalRaids = false,        -- raids de microchip nao sao raid events
-	EnableSideProgression = false   -- prioridades EXATAS: fruta > evento > nivel
+	EnableSideProgression = false,  -- prioridades EXATAS: fruta > evento > nivel
+	AutoFarmSetHome = true,        -- marca spawn somente ao chegar de verdade na ilha da quest
+	AutoFarmUseHome = true         -- volta ao spawn marcado se ele for da ilha-alvo
 	}
 
 	getgenv().Configs = getgenv().Configs or {}
@@ -1471,6 +1477,122 @@ local function QuestNpcDistance(position)
     return (root.Position - position).Magnitude
 end
 
+-- AUTO HOME PARA QUESTS (Zyon)
+-- A ilha e identificada pelo spawn REAL no _WorldOrigin.PlayerSpawns do time.
+-- Nao inventamos o nome da ilha a partir da quest. Se nao for possivel resolver,
+-- usamos a rota normal sem solicitar TP para um spawn incerto.
+local QuestHomeLastSetAt, QuestHomeLastTpAt = 0, 0
+local QuestHomeLastAttemptKey = nil
+local QuestHomeLastWarnAt = 0
+
+local function QuestHomeSpawnValue()
+    local data = LocalPlayer:FindFirstChild("Data")
+    local current = data and data:FindFirstChild("SpawnPoint")
+    return current and tostring(current.Value) or nil
+end
+
+local function QuestHomeIslandAt(position)
+    local world = workspace:FindFirstChild("_WorldOrigin")
+    local folder = world and world:FindFirstChild("PlayerSpawns")
+    local team = LocalPlayer.Team
+    local teamFolder = team and folder and folder:FindFirstChild(team.Name)
+    if not teamFolder then return nil, math.huge end
+
+    local nearestName, nearestDistance = nil, math.huge
+    -- Cada filho de PlayerSpawns/<Time> representa uma regiao de spawn.
+    -- Pode ser Model ou Part conforme o servidor/Sea.
+    for _, region in ipairs(teamFolder:GetChildren()) do
+        local pos
+        if region:IsA("BasePart") then
+            pos = region.Position
+        elseif region:IsA("Model") then
+            pos = region:GetPivot().Position
+        elseif region:IsA("Folder") then
+            local first = region:FindFirstChildWhichIsA("BasePart", true)
+            if first then pos = first.Position end
+        end
+        if pos then
+            local distance = (position - pos).Magnitude
+            if distance < nearestDistance then
+                nearestName, nearestDistance = region.Name, distance
+            end
+        end
+    end
+    -- Uma ilha muito distante nao e prova de que o spawn corresponde a quest.
+    if nearestDistance > 1300 then return nil, nearestDistance end
+    return nearestName, nearestDistance
+end
+
+local function QuestHomeTryReturn(position, questName)
+    if Config.AutoFarmUseHome == false then return false end
+    local before = QuestNpcDistance(position)
+    if before < 1800 or tick() - QuestHomeLastTpAt < 90 then return false end
+    local expectedIsland, spawnToQuest = QuestHomeIslandAt(position)
+    local marked = QuestHomeSpawnValue()
+    if not (expectedIsland and marked and marked == expectedIsland) then return false end
+    -- A volta ao spawn so ajuda quando o ponto marcado e bem mais perto.
+    if spawnToQuest + 900 >= before then return false end
+    QuestHomeLastTpAt = tick() -- anti-loop ate mesmo quando servidor nega
+    LogChange("quest_home_return", string.format(
+        "quest: returning to marked spawn %s; npc=%s; distance=%.0f", marked, tostring(questName), before))
+    SetStatus("quest | returning to marked spawn")
+    local ok, response = pcall(function()
+        return CommF_:InvokeServer("TeleportToSpawn")
+    end)
+    if not ok then
+        warn("[Zyon] quest: TeleportToSpawn failed: " .. tostring(response))
+        return false
+    end
+    local deadline = tick() + 8
+    while tick() < deadline do
+        if QuestNpcDistance(position) < before - 650 then
+            print(string.format("[Zyon] quest: home return CONFIRMED; npc remaining %.0f", QuestNpcDistance(position)))
+            return true
+        end
+        task.wait(0.25)
+    end
+    warn(string.format("[Zyon] quest: home return NOT confirmed; %.0f -> %.0f; using normal travel",
+        before, QuestNpcDistance(position)))
+    return false
+end
+
+local function QuestHomeTryMark(position, questName)
+    if Config.AutoFarmSetHome == false then return end
+    if QuestNpcDistance(position) > 35 then return end
+    local region, regionDistance = QuestHomeIslandAt(position)
+    if not region then
+        if tick() - QuestHomeLastWarnAt > 120 then
+            QuestHomeLastWarnAt = tick()
+            warn("[Zyon] quest: cannot identify safe spawn for " .. tostring(questName)
+                .. "; leaving existing home point unchanged")
+        end
+        return
+    end
+    if QuestHomeSpawnValue() == region then return end
+    local key = tostring(game.PlaceId) .. ":" .. region
+    -- Nao chama SetSpawnPoint repetidamente se o servidor rejeitou.
+    if QuestHomeLastAttemptKey == key and tick() - QuestHomeLastSetAt < 180 then return end
+    QuestHomeLastAttemptKey, QuestHomeLastSetAt = key, tick()
+    LogChange("quest_home_mark", "quest: marking home on quest island " .. region)
+    local ok, response = pcall(function()
+        return CommF_:InvokeServer("SetSpawnPoint")
+    end)
+    if not ok then
+        warn("[Zyon] quest: SetSpawnPoint failed: " .. tostring(response))
+        return
+    end
+    local deadline = tick() + 4
+    repeat
+        if QuestHomeSpawnValue() == region then
+            print("[Zyon] quest: home spawn CONFIRMED on " .. region)
+            return
+        end
+        task.wait(0.2)
+    until tick() >= deadline
+    warn(string.format("[Zyon] quest: spawn NOT confirmed: expected=%s actual=%s (%.0f studs from region)",
+        region, tostring(QuestHomeSpawnValue()), regionDistance))
+end
+
 local function ApproachQuestNpc(position, questName)
     -- NAO comecar uma tween gigante: o cliente pode completar o Tween,
     -- mas o servidor devolver a posicao. A cada trecho verificamos a
@@ -1478,7 +1600,12 @@ local function ApproachQuestNpc(position, questName)
     local startDistance = QuestNpcDistance(position)
     if startDistance <= QUEST_NPC_RADIUS then return true end
 
-    LogChange("quest_retry", string.format("quest: route to %s, %.0f studs", tostring(questName), startDistance))
+    -- Se a conta JA marcou este spawn, teleporte pela funcao Home do jogo.
+    -- Nunca tenta marcar remotamente estando numa ilha distante.
+    QuestHomeTryReturn(position, questName)
+    local afterHome = QuestNpcDistance(position)
+    if afterHome <= QUEST_NPC_RADIUS then return true end
+    LogChange("quest_retry", string.format("quest: route to %s, %.0f studs", tostring(questName), afterHome))
     SetStatus("quest | traveling to " .. tostring(questName))
 
     local deadline = tick() + math.clamp(startDistance / 160 + 32, 42, 115)
@@ -1570,6 +1697,10 @@ local function TakeQuest()
         lastTakeQuest = tick() + 18
         return
     end
+
+    -- Marca a ilha apenas APOS estar no NPC. O comando de Home so sera usado
+    -- em proximas viagens caso SpawnPoint do jogador confirme a mesma ilha.
+    QuestHomeTryMark(questPos, q.NameQuest)
 
     LogChange("quest_start", "quest: starting " .. string.lower(tostring(q.NameQuest)))
     SetStatus("quest | starting " .. string.lower(tostring(q.NameQuest)))
@@ -3191,6 +3322,10 @@ local function FarmLevelLogic()
         return
     end
     local destination = waypoint.Position + Vector3.new(0, 20, 0)
+    -- Missao ja ativa: ao voltar de uma fruta/evento, tambem pode usar Home
+    -- para regressar a ilha dos monstros em vez de atravessar o mar inteiro.
+    -- So usa se o spawn marcado corresponder a ilha deste waypoint.
+    QuestHomeTryReturn(destination, expected.NameQuest)
     local distance = LocalPlayer:DistanceFromCharacter(destination)
     if distance > 42 then
         LogChange("farm_target", "farm: going to " .. questName .. " spawn (" .. waypoint.Source .. ")")
@@ -5194,10 +5329,34 @@ end
 
 local CASTLE_EVENT_POS = Vector3.new(-5000, 350, -3035)
 local FACTORY_EVENT_POS = Vector3.new(448, 199, -441)
-local EventAnnouncedUntil = {FACTORY = 0, CASTLE = 0}
--- Os avisos de sistema permitem viajar ao evento mesmo antes dos NPCs
--- serem carregados no streaming do cliente. A detecao de inimigos reais
--- continua funcionando quando o chat do jogo nao emite esses avisos.
+-- Bosses da prioridade 2: SOMENTE participar dos eventos que ja surgiram.
+-- Nao gastar Fist of Darkness, Sweet Chalice, God's Chalice, nem acionar invocacao.
+-- Posicoes de busca servem SOMENTE quando o aviso chegou mas o boss ainda
+-- nao foi carregado por StreamingEnabled. Se estiver carregado, o alvo real manda.
+local DARK_ARENA_EVENT_POS = Vector3.new(3807, 12, -3452)
+local CAKE_EVENT_POS = Vector3.new(-2251, 146, -12196)
+local RaidBossEvents = {
+    DARKBEARD = {sea = 2, label = "darkbeard", position = DARK_ARENA_EVENT_POS},
+    CAKE_PRINCE = {sea = 3, label = "katakuri v1 / cake prince", position = CAKE_EVENT_POS},
+    DOUGH_KING = {sea = 3, label = "katakuri v2 / dough king", position = CAKE_EVENT_POS},
+    RIP_INDRA = {sea = 3, label = "rip_indra true form", position = CASTLE_EVENT_POS},
+}
+local EventAnnouncedUntil = {FACTORY = 0, CASTLE = 0,
+    DARKBEARD = 0, CAKE_PRINCE = 0, DOUGH_KING = 0, RIP_INDRA = 0}
+local EventScoutCooldown = {}
+local BossLastDetected = {}
+
+local function EventBossKind(name)
+    local lower = tostring(name):lower()
+    if lower:find("darkbeard", 1, true) then return "DARKBEARD" end
+    if lower:find("dough king", 1, true) then return "DOUGH_KING" end
+    if lower:find("cake prince", 1, true) then return "CAKE_PRINCE" end
+    if lower:find("rip_indra", 1, true) or lower:find("rip indra", 1, true) then
+        return "RIP_INDRA"
+    end
+    return nil
+end
+
 local function HandleEventMessage(message)
     if type(message) ~= "string" then return end
     local msg = message:lower()
@@ -5221,6 +5380,24 @@ local function HandleEventMessage(message)
         EventAnnouncedUntil.CASTLE = tick() + 270
         LogChange("event_notice", "raid event: pirates approaching castle")
     end
+    if Config.AutoRaidBossEvents ~= false then
+        local boss, lifetime = nil, 600
+        if msg:find("power of darkness has been unleashed", 1, true) then
+            boss, lifetime = "DARKBEARD", 900
+        elseif msg:find("dimension worthy of a god has spawned", 1, true) then
+            boss, lifetime = "DOUGH_KING", 600
+        elseif msg:find("a dimension has spawned", 1, true) then
+            boss, lifetime = "CAKE_PRINCE", 600
+        elseif msg:find("a barrier has been broken", 1, true) then
+            boss, lifetime = "RIP_INDRA", 600
+        end
+        if boss and ((RaidBossEvents[boss].sea == 2 and World.Sea2())
+            or (RaidBossEvents[boss].sea == 3 and World.Sea3())) then
+            EventAnnouncedUntil[boss] = tick() + lifetime
+            EventScoutCooldown[boss] = nil
+            LogChange("event_boss_notice", "raid event: boss " .. RaidBossEvents[boss].label .. " announced")
+        end
+    end
 end
 pcall(function()
     local TextChatService = game:GetService("TextChatService")
@@ -5240,8 +5417,50 @@ pcall(function()
     end
 end)
 
+-- So modelos VIVOS no Workspace sao alvos. Modelos em ReplicatedStorage
+-- nao provam que o boss nasceu (e nao podem ser atacados).
+local function FindLiveRaidBoss()
+    if Config.AutoRaidBossEvents == false then return nil, nil end
+    local bestKey, bestEnemy, bestDistance = nil, nil, math.huge
+    for _, enemy in ipairs(workspace.Enemies:GetChildren()) do
+        if enemy:IsA("Model") then
+            local boss = EventBossKind(enemy.Name)
+            local config = boss and RaidBossEvents[boss]
+            if config and ((config.sea == 2 and World.Sea2())
+                or (config.sea == 3 and World.Sea3())) then
+                local hum = enemy:FindFirstChildOfClass("Humanoid")
+                local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+                if hum and hum.Health > 0 and root then
+                    local distance = LocalPlayer:DistanceFromCharacter(root.Position)
+                    if distance < bestDistance then
+                        bestKey, bestEnemy, bestDistance = boss, enemy, distance
+                    end
+                    BossLastDetected[boss] = tick()
+                end
+            end
+        end
+    end
+    return bestKey, bestEnemy
+end
+
 local function FindEventEnemy()
     if Config.AutoEventRaids == false then return nil, nil end
+    -- Bosses ja vivos tem precedencia sobre NPCs comuns do Pirate Raid.
+    local bossName, bossEnemy = FindLiveRaidBoss()
+    if bossEnemy then return bossName, bossEnemy end
+    -- Se o boss foi anunciado, viajar uma vez para confirmar seu aparecimento.
+    -- Apos scouting sem encontrar nada, retomar LEVEL ate surgir um modelo real.
+    if Config.AutoRaidBossEvents ~= false then
+        for _, key in ipairs({"DARKBEARD", "DOUGH_KING", "CAKE_PRINCE", "RIP_INDRA"}) do
+            local cfg = RaidBossEvents[key]
+            local rightSea = (cfg.sea == 2 and World.Sea2())
+                or (cfg.sea == 3 and World.Sea3())
+            if rightSea and tick() < (EventAnnouncedUntil[key] or 0)
+                and tick() >= (EventScoutCooldown[key] or 0) then
+                return key, nil
+            end
+        end
+    end
     if World.Sea2() then
         local core = workspace.Enemies:FindFirstChild("Core")
         local hum = core and core:FindFirstChildOfClass("Humanoid")
@@ -5258,7 +5477,9 @@ local function FindEventEnemy()
             local legacyRaider = enemy.Name:lower():find("pirate", 1, true)
                 or enemy.Name:lower():find("marine", 1, true)
                 or enemy.Name:lower():find("raider", 1, true)
-            if hum and hum.Health > 0 and root and ((lvl and lvl <= 1500) or (not lvl and legacyRaider))
+            -- Protege contra confundir o boss com o Pirate Raid no mesmo castelo.
+            if not EventBossKind(enemy.Name) and hum and hum.Health > 0 and root
+                and ((lvl and lvl <= 1500) or (not lvl and legacyRaider))
                 and (root.Position - CASTLE_EVENT_POS).Magnitude <= 900 then
                 local distance = LocalPlayer:DistanceFromCharacter(root.Position)
                 if distance < bestDist then
@@ -5279,16 +5500,32 @@ end
 
 local function FightEventEnemy(eventName)
     local started = tick()
-    LogChange("event_active", "raid event: " .. string.lower(eventName) .. " detected")
-    while tick() - started < 45 do
+    local bossCfg = RaidBossEvents[eventName]
+    local label = bossCfg and bossCfg.label or (eventName == "FACTORY" and "factory" or "castle pirate raid")
+    LogChange("event_active", "raid event: " .. label .. " detected")
+    while tick() - started < (bossCfg and 100 or 45) do
         local activeEvent, enemy = FindEventEnemy()
         if activeEvent ~= eventName then break end
         if not enemy then
-            -- O evento comecou, mas os NPCs podem nao estar carregados.
-            -- Aproximar do mapa do evento sem chamar requestEntrance ou raid chip.
-            local destination = eventName == "FACTORY" and FACTORY_EVENT_POS or CASTLE_EVENT_POS
-            SetStatus(eventName == "FACTORY" and "event | going to factory" or "event | going to castle")
+            -- Um boss que JA foi visto e desapareceu provavelmente morreu.
+            -- Nao prender o nivel tentando voltar ao local por minutos.
+            if bossCfg and BossLastDetected[eventName]
+                and tick() - BossLastDetected[eventName] >= 12 then
+                EventAnnouncedUntil[eventName] = 0
+                LogChange("event_boss_done", "raid event: boss " .. label .. " no longer alive; resume level")
+                break
+            end
+            -- Sem boss vivo observado, uma unica busca limitada por evento.
+            if bossCfg and tick() - started >= 80 then
+                EventScoutCooldown[eventName] = EventAnnouncedUntil[eventName] or (tick() + 90)
+                LogChange("event_scout", "raid event: " .. label .. " not found after scouting; resume level")
+                break
+            end
+            local destination = bossCfg and bossCfg.position
+                or (eventName == "FACTORY" and FACTORY_EVENT_POS or CASTLE_EVENT_POS)
+            SetStatus("event | locating " .. label)
             if LocalPlayer:DistanceFromCharacter(destination) > 160 then
+                -- Movimento direto, SEM SmartTween/requestEntrance/TeleportToSpawn.
                 local motion = RunTween(destination + Vector3.new(0, 16, 0), nil, 350)
                 if not motion then break end
                 local deadline = tick() + 8
@@ -5296,32 +5533,31 @@ local function FightEventEnemy(eventName)
                     task.wait(0.2)
                 end
             else
-                task.wait(1)
-            end
-            -- Prosseguir ate os inimigos darem spawn ou o prazo do aviso acabar.
-        else
-        local hum = enemy:FindFirstChildOfClass("Humanoid")
-        local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
-        if not hum or hum.Health <= 0 or not root or not root.Parent then break end
-        SetStatus((eventName == "FACTORY" and "event | factory core" or "event | castle pirate raid"))
-        local distance = LocalPlayer:DistanceFromCharacter(root.Position)
-        if distance > 28 then
-            local destination = root.Position + Vector3.new(0, 12, 4)
-            local moving = RunTween(destination, nil, 350) -- movimento direto, SEM requestEntrance
-            if not moving then break end
-            local deadline = tick() + math.clamp(distance / 350 + 1.5, 2, 14)
-            while tick() < deadline and hum.Parent and hum.Health > 0 do
-                if LocalPlayer:DistanceFromCharacter(root.Position) <= 29 then break end
-                if moving.PlaybackState == Enum.PlaybackState.Cancelled then break end
-                task.wait(0.18)
+                task.wait(0.8)
             end
         else
-            EquipWeapon()
-            local ok, err = pcall(Attack)
-            if not ok then warn("[Zyon] raid event attack: " .. tostring(err)) end
-            task.wait(0.15)
+            local hum = enemy:FindFirstChildOfClass("Humanoid")
+            local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+            if not hum or hum.Health <= 0 or not root or not root.Parent then break end
+            SetStatus("event | defeating " .. label)
+            local distance = LocalPlayer:DistanceFromCharacter(root.Position)
+            if distance > 28 then
+                local destination = root.Position + Vector3.new(0, 12, 4)
+                local moving = RunTween(destination, nil, 350)
+                if not moving then break end
+                local deadline = tick() + math.clamp(distance / 350 + 1.5, 2, 14)
+                while tick() < deadline and hum.Parent and hum.Health > 0 do
+                    if LocalPlayer:DistanceFromCharacter(root.Position) <= 29 then break end
+                    if moving.PlaybackState == Enum.PlaybackState.Cancelled then break end
+                    task.wait(0.18)
+                end
+            else
+                EquipWeapon()
+                local ok, err = pcall(Attack)
+                if not ok then warn("[Zyon] raid event attack: " .. tostring(err)) end
+                task.wait(0.15)
+            end
         end
-        end -- enemy ~= nil
     end
 end
 
@@ -5362,8 +5598,8 @@ local function StartPriorityWork(mode, target)
                 RollFruitOnce()
             elseif mode == "EVENT_FACTORY" then
                 FightEventEnemy("FACTORY")
-            elseif mode == "EVENT_CASTLE" then
-                FightEventEnemy("CASTLE")
+            elseif type(mode) == "string" and mode:sub(1, 6) == "EVENT_" then
+                FightEventEnemy(mode:sub(7))
             else
                 RunLevelPriorityStep()
             end
@@ -5390,18 +5626,18 @@ local function ChoosePriority()
     end
     if FruitSpinDue() then return "FRUIT_ROLL", nil end
     local event, enemy = FindEventEnemy()
-    if event == "FACTORY" then return "EVENT_FACTORY", enemy end
-    if event == "CASTLE" then return "EVENT_CASTLE", enemy end
+    if event then return "EVENT_" .. event, enemy end
     return "LEVEL", nil
 end
 
 -- Nao existem threads independentes de auto-farm/raid/frutas disputando Tween.
 -- A troca de prioridade cancela o worker ANTES de iniciar o proximo.
 task.spawn(function()
-    print("[Zyon] priorities ready: FRUIT > FACTORY/CASTLE EVENT > LEVEL")
-    print(string.format("[Zyon] fruits options: pickup=%s spin=%s store=%s roll>=7200s; event=%s normalRaids=%s sideProgression=%s",
+    print("[Zyon] priorities ready: FRUIT > FACTORY/CASTLE/BOSSES EVENT > LEVEL")
+    print(string.format("[Zyon] fruits options: pickup=%s spin=%s store=%s roll>=7200s; event=%s bossEvents=%s normalRaids=%s sideProgression=%s",
         tostring(Config.AutoFruitPickup), tostring(Config.AutoFruitSpin), tostring(Config.AutoFruitStore),
-        tostring(Config.AutoEventRaids), tostring(Config.AutoNormalRaids), tostring(Config.EnableSideProgression)))
+        tostring(Config.AutoEventRaids), tostring(Config.AutoRaidBossEvents),
+        tostring(Config.AutoNormalRaids), tostring(Config.EnableSideProgression)))
     while task.wait(0.25) do
         if AutoRejoinActive or FindDisconnectPrompt() then
             if PriorityWorker then

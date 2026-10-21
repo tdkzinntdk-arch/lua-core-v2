@@ -5088,40 +5088,108 @@ local function FruitSpinDue()
     return true
 end
 
+-- Comparacao com fontes publicas do Redz e de outros hubs: o protocolo
+-- exposto para o gacha aleatorio e CommF_:InvokeServer("Cousin", "Buy").
+-- "Cousin", "Check" nao foi encontrado nessas rotinas e nao pode ser usado
+-- como prova de cooldown; o servidor tambem pode devolver nil legitimamente.
+local FruitSpinUnconfirmed = 0
+local function SnapshotCarriedFruits()
+    local snapshot = {}
+    for _, container in ipairs({LocalPlayer.Backpack, LocalPlayer.Character}) do
+        if container then
+            for _, obj in ipairs(container:GetChildren()) do
+                if obj:IsA("Tool") then
+                    local lower = obj.Name:lower()
+                    if lower:find("fruit", 1, true)
+                        or tostring(obj.ToolTip):lower() == "blox fruit"
+                        or obj:FindFirstChild("Fruit") then
+                        snapshot[obj] = true
+                    end
+                end
+            end
+        end
+    end
+    return snapshot
+end
+
+local function NewlyCarriedFruit(before)
+    for _, container in ipairs({LocalPlayer.Backpack, LocalPlayer.Character}) do
+        if container then
+            for _, obj in ipairs(container:GetChildren()) do
+                if obj:IsA("Tool") and not before[obj] then
+                    local lower = obj.Name:lower()
+                    if lower:find("fruit", 1, true)
+                        or tostring(obj.ToolTip):lower() == "blox fruit"
+                        or obj:FindFirstChild("Fruit") then
+                        return obj.Name
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function RollFruitOnce()
-    -- Zioles / Gacha aleatorio: nao confundir 'Cousin' com compra no Dealer.
-    -- O servidor pode retornar nil durante cooldown, indisponibilidade ou
-    -- protocolo alterado. Nunca declarar compra bem-sucedida sem evidencias.
-    FruitSpinNext = tick() + 600 -- no minimo 10min quando a compra NAO for confirmada
+    -- Nao confundir Zioles com o Blox Fruit Dealer (fruta de estoque).
+    -- O cooldown do jogo e de aproximadamente 2h POR CONTA; reiniciar o script
+    -- nao reseta o cooldown do servidor. Nao disparar compras repetidamente.
+    FruitSpinNext = tick() + 600
     SetStatus("fruits | rolling at zioles")
     local moneyBefore = LocalPlayer.Data.Beli.Value
-    local checkOk, checkResult = pcall(function()
-        return CommF_:InvokeServer("Cousin", "Check")
-    end)
-    if not checkOk then
-        warn("[Zyon] fruit: Zioles Check failed: " .. tostring(checkResult) .. "; retry >=10min")
-        return
-    end
-    LogChange("fruit_gacha_check", "fruit: Zioles Check => " .. tostring(checkResult))
-
-    LogChange("fruit_spin", "fruit: Zioles GACHA - Cousin/Buy (random fruit)")
+    local level = LocalPlayer.Data.Level.Value
+    local estimatedCost = 25000 + 150 * (level - 1)
+    local fruitBefore = SnapshotCarriedFruits()
+    -- O auto-store permanece pausado so durante a confirmacao da compra:
+    -- caso contrario, a fruta pode sumir da mochila antes da checagem.
+    PAUSE_AUTO_STORE = true
+    LogChange("fruit_spin", string.format(
+        "fruit: Zioles random roll (Cousin/Buy); lv=%d Beli=%d estimatedCost=%d",
+        level, moneyBefore, estimatedCost))
     local ok, response = pcall(function()
         return CommF_:InvokeServer("Cousin", "Buy")
     end)
     if not ok then
-        warn("[Zyon] fruit: Zioles Buy failed: " .. tostring(response) .. "; retry >=10min")
+        PAUSE_AUTO_STORE = false
+        FruitSpinUnconfirmed = FruitSpinUnconfirmed + 1
+        warn("[Zyon] fruit: Zioles remote ERROR: " .. tostring(response)
+            .. "; preserving Beli and retrying later")
         return
     end
-    task.wait(2)
-    local spent = math.max(0, moneyBefore - LocalPlayer.Data.Beli.Value)
-    if spent > 0 then
-        FruitSpinNext = tick() + math.max(7200, tonumber(Config.FruitSpinInterval) or 7200)
-        LogChange("fruit_spin", string.format("fruit: Zioles CONFIRMED (spent %d Beli); next >=2h", spent))
-    else
-        warn("[Zyon] fruit: Zioles UNCONFIRMED; Check=" .. tostring(checkResult)
-            .. "; Buy=" .. tostring(response)
-            .. "; Beli unchanged; next check >=10min")
+
+    -- O remoto nao tem contrato publico de retorno. Mesmo uma resposta nil
+    -- pode vir de uma invocacao que foi aceita, entao OBSERVAR saldo + Tool.
+    -- Nao fazer um segundo Buy de confirmacao: isso poderia gastar de novo.
+    local spent, newFruit = 0, nil
+    for _ = 1, 20 do
+        spent = math.max(0, moneyBefore - LocalPlayer.Data.Beli.Value)
+        newFruit = NewlyCarriedFruit(fruitBefore)
+        if spent > 0 or newFruit then break end
+        task.wait(0.5)
     end
+    PAUSE_AUTO_STORE = false
+    if spent > 0 then
+        FruitSpinUnconfirmed = 0
+        FruitSpinNext = tick() + math.max(7200, tonumber(Config.FruitSpinInterval) or 7200)
+        LogChange("fruit_spin", string.format(
+            "fruit: Zioles purchase CONFIRMED, spent %d Beli, fruit=%s; next roll >=2h",
+            spent, tostring(newFruit or "not yet visible")))
+        return
+    end
+
+    FruitSpinUnconfirmed = FruitSpinUnconfirmed + 1
+    if newFruit then
+        -- Nova ferramenta sem gasto de dinheiro pode ter vindo de outra fonte.
+        -- Registrar como incerto, evitando atribuir a compra ao Zioles.
+        warn("[Zyon] fruit: new fruit Tool seen (" .. newFruit
+            .. ") but Beli unchanged; Zioles purchase NOT independently confirmed")
+    end
+    local backoff = FruitSpinUnconfirmed >= 3 and 1800 or 600
+    FruitSpinNext = tick() + backoff
+    warn(string.format(
+        "[Zyon] fruit: Zioles UNCONFIRMED; Buy returned %s; Beli %d -> %d; newTool=%s; attempts=%d; retry >=%dmin. Check in-game Zioles cooldown/UI.",
+        tostring(response), moneyBefore, LocalPlayer.Data.Beli.Value,
+        tostring(newFruit), FruitSpinUnconfirmed, backoff / 60))
 end
 
 local CASTLE_EVENT_POS = Vector3.new(-5000, 350, -3035)

@@ -11,7 +11,9 @@ getgenv().Configs = {
 	Saber = true,
 	CursedDualKatana = true,
 	SkullGuitar = true,
-	RaceV3 = true
+	RaceV3 = true,
+	AutoRejoin = true,
+	AutoRejoinMaxAttempts = 12
 }
 
 -- ===== CORRIGIDO (Zyon) =====
@@ -31,7 +33,9 @@ do
 		Saber = true,
 		CursedDualKatana = true,
 		SkullGuitar = true,
-		RaceV3 = true
+		RaceV3 = true,
+		AutoRejoin = true,
+		AutoRejoinMaxAttempts = 12
 	}
 
 	getgenv().Configs = getgenv().Configs or {}
@@ -72,21 +76,91 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local CommF_ = ReplicatedStorage.Remotes.CommF_
 local CommE = ReplicatedStorage.Remotes.CommE
 local MaxLevel = (workspace:GetAttribute("LEVEL_CAP") or 2800)
-CoreGui.RobloxPromptGui.promptOverlay.ChildAdded:Connect(function(v)
-	if v.Name == "ErrorPrompt" and v:FindFirstChild("MessageArea") and v.MessageArea:FindFirstChild("ErrorFrame") then
-		ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", game.JobId)
-	end
-end)
-game.NetworkClient.ChildRemoved:Connect(function()
-	ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", game.JobId)
-	task.wait(5)
-	TeleportService:Teleport(game.PlaceId)
+-- AUTO REJOIN (Zyon): reentrada nao depende de __ServerBrowser:InvokeServer,
+-- que pode falhar justamente quando a conexao com o servidor foi perdida.
+-- Mantem uma unica sequencia de tentativas, com pcall + intervalo e logs.
+-- Limite: se o processo Roblox for encerrado, um LocalScript nao pode reabri-lo.
+-- Apos o teleport, o executor precisa executar o Kaitun novamente (Auto Execute).
+local AutoRejoinActive = false
+local AutoRejoinReason = nil
+local AutoRejoinLastError = nil
+local AutoRejoinMaxAttempts = math.clamp(tonumber(Config.AutoRejoinMaxAttempts) or 12, 1, 30)
+
+local function StartAutoRejoin(reason)
+    if Config.AutoRejoin == false then return end
+    if AutoRejoinActive then
+        return -- evita multiplos loops competindo entre si
+    end
+    AutoRejoinActive = true
+    AutoRejoinReason = tostring(reason or "unknown")
+
+    task.spawn(function()
+        print("[Zyon] rejoin: detected " .. AutoRejoinReason)
+        for attempt = 1, AutoRejoinMaxAttempts do
+            -- Espaco inicial para permitir que a interface de erro estabilize;
+            -- apos isso, evita chamar o servico de teleporte a cada frame.
+            local delaySeconds = (attempt == 1) and 2 or math.min(12 + (attempt - 2) * 8, 60)
+            task.wait(delaySeconds)
+            print(("[Zyon] rejoin: attempt %d/%d (place %s)"):format(
+                attempt, AutoRejoinMaxAttempts, tostring(game.PlaceId)))
+            local ok, err = pcall(function()
+                -- Teleport(placeId, player) funciona a partir do cliente.
+                -- Nao solicita teleporte para game.JobId (servidor que caiu).
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            end)
+            if not ok then
+                AutoRejoinLastError = tostring(err)
+                warn("[Zyon] rejoin: teleport rejected: " .. AutoRejoinLastError)
+            else
+                -- A chamada retornar nao garante que o teleport ocorreu.
+                -- O TeleportInitFailed, abaixo, informa quando ele falhou.
+                print("[Zyon] rejoin: teleport requested; awaiting connection")
+            end
+        end
+        warn("[Zyon] rejoin: retries exhausted; last error: " ..
+            tostring(AutoRejoinLastError or "not confirmed"))
+        AutoRejoinActive = false
+    end)
+end
+
+-- Prompt aparece assincronamente e pode ser criado antes de MessageArea.
+-- Esperamos a GUI sem bloquear o carregamento do Kaitun.
+task.spawn(function()
+    local promptGui = CoreGui:WaitForChild("RobloxPromptGui", 25)
+    local overlay = promptGui and promptGui:WaitForChild("promptOverlay", 25)
+    if not overlay then
+        warn("[Zyon] rejoin: RobloxPromptGui not found; using other signals")
+        return
+    end
+    local function CheckErrorPrompt(child)
+        if child and child.Name == "ErrorPrompt" then
+            StartAutoRejoin("Roblox ErrorPrompt")
+        end
+    end
+    overlay.ChildAdded:Connect(CheckErrorPrompt)
+    for _, child in ipairs(overlay:GetChildren()) do
+        CheckErrorPrompt(child)
+    end
 end)
 
+-- Disparador complementar: nao trate a remocao de QUALQUER filho de
+-- NetworkClient como queda. Somente desconexao do replicador do cliente.
+pcall(function()
+    local network = game:GetService("NetworkClient")
+    network.ChildRemoved:Connect(function(child)
+        if child and child.ClassName == "ClientReplicator" then
+            StartAutoRejoin("ClientReplicator removed")
+        end
+    end)
+end)
+
+-- Falha de teleport (inclusive servidor lotado): nao chama o RemoteFunction
+-- do mundo, pois ele pode nao responder quando o cliente esta offline.
 TeleportService.TeleportInitFailed:Connect(function(player, result, err)
-	if result ~= Enum.TeleportResult.GameFull then
-		ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", game.JobId)
-	end
+    if player ~= LocalPlayer then return end
+    AutoRejoinLastError = tostring(result) .. ": " .. tostring(err)
+    warn("[Zyon] rejoin: TeleportInitFailed: " .. AutoRejoinLastError)
+    StartAutoRejoin("TeleportInitFailed")
 end)
 
 if Config.WhiteScreen then

@@ -1503,20 +1503,85 @@ local function TakeQuestBone(b)
 	end
 end
 
-local function GetMonsterName()
-	local _v = {}
-	for _, v in workspace.Enemies:GetChildren() do
-		if not table.find(_v, v.Name) and v:IsA("Model") and v.Name ~= "PirateBasic" and not v.Name:find("Brigade") and not v.Name:find("FishBoat") and v:FindFirstChildOfClass("Humanoid") and v.Humanoid.Health > 0 and v:FindFirstChild("HumanoidRootPart") then
-			table.insert(_v, v.Name)
-		end
-	end
-	for _, v in _v do
-		local name = v:gsub(" %pLv%. ?%d+%p", "")
-		if QuestController.CurrentQuest == name then
-			return name
-		end
-	end
-	return false
+-- Com a quest ativa, use o nome informado pelo servidor, mesmo se os mobs
+-- ainda nao estiverem carregados em workspace.Enemies (StreamingEnabled).
+local function NormalizeQuestMobName(name)
+    name = tostring(name or "")
+    name = name:gsub("%s*%[[Ll]v%.?%s*%d+%]", "")
+    name = name:gsub("%s*%[[Bb]oss%]", "")
+    return name:match("^%s*(.-)%s*$"):lower()
+end
+
+local function GetActiveQuestMobName()
+    local current = QuestController.CurrentQuest
+    if current and current ~= "" then
+        return tostring(current)
+    end
+    local quest = GetQuest()
+    return quest and quest.NameMonster or nil
+end
+
+local function FindActiveQuestEnemy()
+    local target = NormalizeQuestMobName(GetActiveQuestMobName())
+    if target == "" then
+        return nil
+    end
+    local closest, distance = nil, math.huge
+    for _, enemy in workspace.Enemies:GetChildren() do
+        local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+        local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+        if enemy:IsA("Model") and NormalizeQuestMobName(enemy.Name) == target
+            and humanoid and humanoid.Health > 0 and root then
+            local dist = LocalPlayer:DistanceFromCharacter(root.Position)
+            if dist < distance then
+                closest, distance = enemy, dist
+            end
+        end
+    end
+    return closest
+end
+
+local function FindActiveQuestSpawn()
+    local target = NormalizeQuestMobName(GetActiveQuestMobName())
+    if target == "" then
+        return nil
+    end
+
+    local spawnFolder = ReplicatedStorage:FindFirstChild("FortBuilderReplicatedSpawnPositionsFolder")
+    local worldOrigin = workspace:FindFirstChild("_WorldOrigin")
+    local enemySpawns = worldOrigin and worldOrigin:FindFirstChild("EnemySpawns")
+    local nearest, shortestDistance = nil, math.huge
+    for _, folder in {spawnFolder, enemySpawns} do
+        if folder then
+            for _, marker in folder:GetChildren() do
+                if NormalizeQuestMobName(marker.Name) == target then
+                    local ok, markerPosition = pcall(function()
+                        if marker:IsA("Attachment") then
+                            return marker.WorldPosition
+                        elseif marker:IsA("Model") or marker:IsA("BasePart") then
+                            return marker:GetPivot().Position
+                        end
+                    end)
+                    if ok and markerPosition then
+                        local dist = LocalPlayer:DistanceFromCharacter(markerPosition)
+                        if dist < shortestDistance then
+                            nearest, shortestDistance = markerPosition, dist
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if nearest then
+        return nearest
+    end
+
+    -- Ponto ja usado pela propria rotina CDK para o Mythological Pirate.
+    -- Ajuda quando os marcadores do mapa nao estao replicados no cliente.
+    if World.Sea3() and target == "mythological pirate" then
+        return Vector3.new(-13239, 520, -6813)
+    end
+    return nil
 end
 
 local function LoadItem(v, t)
@@ -2612,67 +2677,80 @@ local function FarmLevelLogic()
 				Tween(n:GetPivot().Position + Vector3.new(0, 25, 0), 350).Completed:Wait()
 			end
 		end
-	elseif levelData == 4 or levelData == 1 then
-		if GetMonsterName() then
-            LogChange("farm_target", "farm: targeting quest mob")
-            SetStatus("farm | targeting quest mob | lv " .. tostring(LocalPlayer.Data.Level.Value))
-			for _, v2 in {workspace.Enemies, ReplicatedStorage} do
-				for _, v in v2:GetChildren() do
-					if v.Name == GetMonsterName() and v.PrimaryPart and v:FindFirstChildOfClass("Humanoid") and v:FindFirstChildOfClass("Humanoid").Health > 0 then
-						local startKillThisNPC = tick()
-						repeat
-							task.wait()
-							TakeQuest()
-							local t = Tween(v:GetPivot().Position + Vector3.new(0, 20, 5), 350)
-							if LocalPlayer:DistanceFromCharacter(v:GetPivot().Position) <= 160 then
-								if t then
-									t:Cancel()
-								end
-								Tween(v:GetPivot().Position + Vector3.new(0, 20, 5), math.huge)
-								if LocalPlayer:DistanceFromCharacter(v:GetPivot().Position) <= 40 then
-									BringMob(v.Name)
-									EquipWeapon()
-									Attack()
-								end
-							end
-						until not v
-							or not v.PrimaryPart
-							or not v:FindFirstChildOfClass("Humanoid")
-							or v:FindFirstChildOfClass("Humanoid").Health <= 0
-							or v.Name ~= GetMonsterName()
-							or (tick() - startKillThisNPC) >= 90
-						if v:IsDescendantOf(workspace.Enemies) then
-							pcall(function()
-								v:Destroy()
-							end)
-						end
-						if not CheckMonster(GetMonsterName()) then
-							break
-						end
-					end
-				end
-			end
-		else
-            LogChange("farm_target", "farm: waiting for quest mob")
-            SetStatus("farm | waiting for quest mob | lv " .. tostring(LocalPlayer.Data.Level.Value))
-			TakeQuest()
-			for _, v in {ReplicatedStorage.FortBuilderReplicatedSpawnPositionsFolder, workspace._WorldOrigin.EnemySpawns} do
-				for _, v2 in v:GetChildren() do
-					if not v2.Name:find("Boss") and QuestController.CurrentQuest == v2.Name then
-                        local spawnDeadline = tick() + 20
-						repeat
-                            task.wait(0.2)
-                            if not v2.Parent then
-                                break
-                            end
-							Tween(v2:GetPivot().Position + Vector3.new(0, 25, 0), 350)
-						until GetMonsterName() or tick() >= spawnDeadline
-						break
-					end
-				end
-			end
-			task.wait(0.25)
-		end
+    elseif levelData == 4 or levelData == 1 then
+        local enemy = FindActiveQuestEnemy()
+        if enemy then
+            LogChange("farm_target", "farm: targeting quest mob " .. tostring(GetActiveQuestMobName()))
+            SetStatus("farm | defeating quest mob | lv " .. tostring(LocalPlayer.Data.Level.Value))
+            local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+            local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+            local deadline = tick() + 75
+            local nextMove = 0
+            while enemy.Parent == workspace.Enemies and humanoid and humanoid.Parent
+                and humanoid.Health > 0 and root and root.Parent and tick() < deadline do
+                TakeQuest()
+                local distance = LocalPlayer:DistanceFromCharacter(root.Position)
+                if distance > 38 and tick() >= nextMove then
+                    Tween(root.Position + Vector3.new(0, 20, 5), 350)
+                    nextMove = tick() + math.clamp(distance / 350, 0.5, 3)
+                elseif distance <= 48 then
+                    BringMob(enemy.Name)
+                    EquipWeapon()
+                    Attack()
+                end
+                task.wait(0.15)
+            end
+            if enemy.Parent and humanoid and humanoid.Health > 0 and tick() >= deadline then
+                LogChange("farm_mob_timeout", "farm: target timeout; looking for another mob")
+            end
+        else
+            -- Antes, sem inimigos carregados, somente procurava marcadores
+            -- com nome EXATAMENTE igual a CurrentQuest. Se nao houvesse
+            -- nenhum, ficava no ar sem navegar para a ilha do monstro.
+            TakeQuest()
+            if not GetQuestData() then
+                LogChange("farm_target", "farm: waiting for quest to start")
+                SetStatus("farm | waiting for quest start | lv " .. tostring(LocalPlayer.Data.Level.Value))
+                task.wait(0.8)
+                return
+            end
+
+            local targetName = tostring(GetActiveQuestMobName() or "unknown")
+            local spawnPosition = FindActiveQuestSpawn()
+            if spawnPosition then
+                local destination = spawnPosition + Vector3.new(0, 25, 0)
+                local dist = LocalPlayer:DistanceFromCharacter(destination)
+                if dist > 95 then
+                    LogChange("farm_target", "farm: moving to " .. targetName .. " spawn")
+                    SetStatus("farm | going to quest mobs | lv " .. tostring(LocalPlayer.Data.Level.Value))
+                    local journey = Tween(destination, 350)
+                    if not journey then
+                        warn("[Zyon] farm: could not start movement to " .. targetName)
+                        task.wait(1)
+                        return
+                    end
+                    -- Inimigos podem aparecer durante o trajeto; reavaliar em
+                    -- vez de esperar cegamente um tween de longa distancia.
+                    local deadline = tick() + math.clamp(dist / 200 + 10, 10, 70)
+                    while tick() < deadline and GetQuestData()
+                        and LocalPlayer:DistanceFromCharacter(destination) > 95 do
+                        if FindActiveQuestEnemy() then
+                            break
+                        end
+                        task.wait(0.35)
+                    end
+                else
+                    LogChange("farm_target", "farm: waiting for " .. targetName .. " near spawn")
+                    SetStatus("farm | waiting for quest mob | lv " .. tostring(LocalPlayer.Data.Level.Value))
+                    task.wait(1.5)
+                end
+            else
+                LogChange("farm_missing_spawn", "farm: no spawn marker for " .. targetName)
+                SetStatus("farm | spawn not found: " .. targetName)
+                warn("[Zyon] farm: spawn location missing for " .. targetName)
+                task.wait(2)
+            end
+        end
 	end
 end
 
@@ -3407,25 +3485,62 @@ end
 KEYS = require(ReplicatedStorage.ItemReplicationService.KEYS)
 IRS = require(ReplicatedStorage.ItemReplicationService)
 MATCH = require(ReplicatedStorage.ItemConfig.Storage).match
+-- Raid: nunca oferecer fruta com valor igual ou superior a 1.000.000 Beli.
+local RAID_FRUIT_PRICE_LIMIT = 1000000
+
 local function GetUseableFruit()
-	local data = IRS:GetItems(KEYS.QUANTITY)
-	for _, v in data do
-		local item = MATCH(v.ItemId)._ok
-		if item.Display.Category == "Blox Fruit" and item.Quality.MoneyPrice < 1000000 then
-			return item.Index.StorageKey
-		end
-	end
+    local ok, data = pcall(function() return IRS:GetItems(KEYS.QUANTITY) end)
+    if not ok or type(data) ~= "table" then
+        warn("[Zyon] Raid: nao foi possivel ler o inventario de frutas")
+        return nil
+    end
+
+    local cheapestKey, cheapestPrice = nil, RAID_FRUIT_PRICE_LIMIT
+    for _, record in data do
+        local itemOk, item = pcall(function() return MATCH(record.ItemId)._ok end)
+        if itemOk and type(item) == "table" and item.Display and item.Quality and item.Index
+            and item.Display.Category == "Blox Fruit" then
+            local price = tonumber(item.Quality.MoneyPrice)
+            local quantity = tonumber(record.Value) or 0
+            local storageKey = item.Index.StorageKey
+            if price and price > 0 and price < RAID_FRUIT_PRICE_LIMIT
+                and quantity > 0 and type(storageKey) == "string" and storageKey ~= ""
+                and price < cheapestPrice then
+                cheapestKey, cheapestPrice = storageKey, price
+            end
+        end
+    end
+    return cheapestKey
+end
+
+-- Frutas fisicas na mochila/personagem podem ser gastas pelo NPC da raid.
+-- Nao seleciona raid enquanto houver uma fruta solta de valor desconhecido.
+local function GetCarriedPhysicalFruit()
+    for _, container in {LocalPlayer.Backpack, LocalPlayer.Character} do
+        if container then
+            for _, tool in container:GetChildren() do
+                if tool:IsA("Tool") then
+                    local original = tool:GetAttribute("OriginalName")
+                    if tool.Name:find("Fruit") or (type(original) == "string" and original:find("Fruit")) then
+                        return tool
+                    end
+                end
+            end
+        end
+    end
+    return nil
 end
 
 CheckCanDungeon = function()
-	local res = CommF_:InvokeServer("RaidsNpc", "Select", "Dark")
-	if HasItem("Special Microchip") then
-		return true
-	elseif GetUseableFruit() then
-		return true
-	elseif LocalPlayer.Data.Beli.Value >= 100000 and ((type(res) == "number" and res == 1) or (type(res) == "string" and not res:find("wait"))) then
-		return true
-	end
+    -- Esta funcao e apenas uma verificacao: nao chama RaidsNpc/Select,
+    -- porque Select pode consumir dinheiro ou uma fruta imediatamente.
+    if HasItem("Special Microchip") then
+        return true
+    end
+    if GetCarriedPhysicalFruit() then
+        return false
+    end
+    return LocalPlayer.Data.Beli.Value >= 100000 or GetUseableFruit() ~= nil
 end
 
 local RaidController = {
@@ -3459,24 +3574,73 @@ end
 
 AutoDungeon = function()
     LogChange("raid", "raid: preparing")
-	local res = CommF_:InvokeServer("RaidsNpc", "Select", "Dark")
-	if not EsperarPersonagem(30, true) then
-		return
-	end
-	if not RaidController.isRaiding then
-		if not (LocalPlayer.Backpack:FindFirstChild("Special Microchip") or Character:FindFirstChild("Special Microchip")) then
-            LogChange("raid_stage", "raid: getting microchip")
+    if not EsperarPersonagem(30, true) then
+        return
+    end
+    if not RaidController.isRaiding then
+        if not HasItem("Special Microchip") then
+            LogChange("raid_stage", "raid: getting microchip safely")
             SetStatus("raid | getting microchip")
-			if LocalPlayer.Data.Beli.Value >= 100000 and ((type(res) == "number" and res == 1) or (type(res) == "string" and not res:find("wait"))) then
-				CommF_:InvokeServer("RaidsNpc", "Select", "Dark")
-			else
-				PAUSE_AUTO_STORE = true
-				CommF_:InvokeServer("LoadFruit", GetUseableFruit())
-				task.wait(0.5)
-				CommF_:InvokeServer("RaidsNpc", "Select", "Dark")
-				PAUSE_AUTO_STORE = false
-			end
-		end
+
+            -- Nao arriscar uma fruta ja carregada (especialmente as raras).
+            -- O auto-store continua funcionando e pode guardá-la no proximo ciclo.
+            local carriedFruit = GetCarriedPhysicalFruit()
+            if carriedFruit then
+                LogChange("raid_fruit_guard", "raid: fruit in backpack; waiting for auto-store: " .. carriedFruit.Name)
+                SetStatus("raid | storing carried fruit")
+                return
+            end
+
+            -- Preferencia: pagar com Beli, sem carregar fruta alguma.
+            if LocalPlayer.Data.Beli.Value >= 100000 then
+                local ok, result = pcall(function()
+                    return CommF_:InvokeServer("RaidsNpc", "Select", "Dark")
+                end)
+                if not ok then
+                    warn("[Zyon] Raid: error buying chip with Beli: " .. tostring(result))
+                end
+                task.wait(0.5)
+                -- Mantem a compatibilidade com Select que devolve 1 (confirmacao).
+                if ok and not HasItem("Special Microchip") and result == 1 then
+                    pcall(function() CommF_:InvokeServer("RaidsNpc", "Select", "Dark") end)
+                    task.wait(0.5)
+                end
+            end
+
+            -- Sem chip: usar SOMENTE fruta comprovadamente abaixo de 1M.
+            if not HasItem("Special Microchip") then
+                local cheapFruit = GetUseableFruit()
+                if not cheapFruit then
+                    LogChange("raid_fruit_guard", "raid: no eligible fruit (< 1M); preserving valuable fruits")
+                    SetStatus("raid | waiting for cheap fruit or Beli")
+                    return
+                end
+
+                PAUSE_AUTO_STORE = true
+                local ok, err = pcall(function()
+                    CommF_:InvokeServer("LoadFruit", cheapFruit)
+                    task.wait(0.6)
+                    -- Se LoadFruit falhou, nao selecionar NPC com fruta desconhecida.
+                    local loadedFruit = GetCarriedPhysicalFruit()
+                    if not loadedFruit then
+                        error("cheap fruit not loaded; NPC selection cancelled")
+                    end
+                    CommF_:InvokeServer("RaidsNpc", "Select", "Dark")
+                end)
+                PAUSE_AUTO_STORE = false
+                if not ok then
+                    warn("[Zyon] Raid: aborting fruit purchase: " .. tostring(err))
+                    return
+                end
+                task.wait(0.5)
+            end
+
+            if not HasItem("Special Microchip") then
+                LogChange("raid_chip", "raid: no microchip yet; will retry safely")
+                SetStatus("raid | waiting for microchip")
+                return
+            end
+        end
 		if World.Sea2() then
             LogChange("raid_stage", "raid: summoning at sea 2")
             SetStatus("raid | summoning at sea 2")

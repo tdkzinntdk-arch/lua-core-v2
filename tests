@@ -1220,46 +1220,44 @@ local lastTakeQuest = 0
 local QuestController, GetQuest, GetQuestData, GetQuestPosition
 
 GetQuestPosition = function(questName)
-    local nearestPos = nil
-    local shortestdist = math.huge
+    questName = tostring(questName or "")
+    if questName == "" then return nil end
     local ok, guideData = pcall(function()
         return require(ReplicatedStorage.GuideModule).Data.NPCList
     end)
-    if not ok or type(guideData) ~= "table" then
-        return nil
-    end
-
-    questName = questName or (GetQuest() and GetQuest().NameQuest)
-    if not questName then
-        return nil
-    end
-
-    for _, entry in guideData do
-        if typeof(entry) == "table" and entry.Position then
-            local matchesQuest = false
-            for _, value in entry do
-                if value == questName then
-                    matchesQuest = true
-                    break
+    if not ok or type(guideData) ~= "table" then return nil end
+    local nearest, nearestDist = nil, math.huge
+    for entryKey, entry in pairs(guideData) do
+        if type(entry) == "table" then
+            local matches = tostring(entryKey):lower() == questName:lower()
+            if not matches then
+                for _, value in pairs(entry) do
+                    if type(value) == "string" and value:lower() == questName:lower() then
+                        matches = true
+                        break
+                    end
                 end
             end
-            if matchesQuest and typeof(entry.Position) == "Vector3" then
-                local distance = LocalPlayer:DistanceFromCharacter(entry.Position)
-                if distance < shortestdist then
-                    shortestdist = distance
-                    nearestPos = entry.Position
+            if matches then
+                local raw = entry.Position or entry.CFrame or entry.position
+                local pos = nil
+                if typeof(raw) == "Vector3" then
+                    pos = raw
+                elseif typeof(raw) == "CFrame" then
+                    pos = raw.Position
+                elseif typeof(raw) == "Instance" and raw:IsA("BasePart") then
+                    pos = raw.Position
                 end
-            elseif matchesQuest and typeof(entry.Position) == "CFrame" then
-                local position = entry.Position.Position
-                local distance = LocalPlayer:DistanceFromCharacter(position)
-                if distance < shortestdist then
-                    shortestdist = distance
-                    nearestPos = position
+                if pos then
+                    local dist = LocalPlayer:DistanceFromCharacter(pos)
+                    if dist < nearestDist then
+                        nearest, nearestDist = pos, dist
+                    end
                 end
             end
         end
     end
-    return nearestPos
+    return nearest
 end
 
 local function TakeQuest()
@@ -1272,21 +1270,36 @@ local function TakeQuest()
     else
         LogChange("quest_target", "quest: no target")
     end
-	if q and q.NameQuest and q.ID and (not GetQuestData() or QuestController.CurrentQuestName ~= q.NameQuest) then
+    if GetQuestData() then
+        return -- never drag player back to quest NPC while mission is active
+    end
+	if q and q.NameQuest and q.ID then
 		local questPos = GetQuestPosition(q.NameQuest)
         LogChange("quest_travel", questPos and "quest: traveling to npc" or "quest: npc position missing")
         -- A missing guide position is not a reason to hop servers; hopping can
         -- interrupt the quest flow and make the character appear elsewhere.
         if not questPos then
-            lastTakeQuest = tick()
+            warn("[Zyon] Quest NPC location unavailable: " .. tostring(q.NameQuest))
+            lastTakeQuest = tick() + 4
             return
         end
-		if questPos and TweenWithRespawnRetry(questPos, 350) then
+        SetStatus("quest | going to npc: " .. tostring(q.NameQuest))
+		if TweenWithRespawnRetry(questPos, 350) then
 			task.wait(0.25)
 			if LocalPlayer:DistanceFromCharacter(questPos) <= 15 then
                 LogChange("quest_start", "quest: starting " .. string.lower(tostring(q.NameQuest)))
                 SetStatus("quest | starting " .. string.lower(tostring(q.NameQuest)))
-				CommF_:InvokeServer("StartQuest", q.NameQuest, q.ID)
+                local ok, result = pcall(function()
+                    return CommF_:InvokeServer("StartQuest", q.NameQuest, q.ID)
+                end)
+                if not ok then
+                    warn("[Zyon] Quest StartQuest failed: " .. tostring(result))
+                else
+                    task.wait(0.35)
+                    if not GetQuestData() then
+                        warn("[Zyon] Quest did not become active: " .. tostring(q.NameQuest))
+                    end
+                end
 			end
 		end
 	end
@@ -1321,11 +1334,13 @@ QuestController = {
 }
 QuestController.Set = function(self, data)
 	self.CurrentQuest = (function()
-		for i, _ in data.Progress do
-			return i
-		end
-	end)()
-	self.CurrentQuestName = data.InternalQuestName
+        if type(data.Progress) ~= "table" then return "" end
+        for i, _ in pairs(data.Progress) do
+            return tostring(i)
+        end
+        return ""
+    end)()
+    self.CurrentQuestName = data.InternalQuestName or ""
 end
 QuestController.Reset = function(self)
 	self.CurrentQuest = ""
@@ -1340,8 +1355,35 @@ QuestController.QuestConnection = ReplicatedStorage.Remotes.QuestUpdate.OnClient
 	QuestController:Reset()
 end)
 
+local function ReadGuideQuest()
+    local ok, data = pcall(function()
+        return require(ReplicatedStorage.GuideModule).Data.QuestData
+    end)
+    if not ok or type(data) ~= "table" or type(data.Task) ~= "table" then
+        return nil
+    end
+    for mobName, count in pairs(data.Task) do
+        if type(mobName) == "string" and mobName ~= "" then
+            return mobName, data.InternalQuestName
+        end
+    end
+    return nil
+end
+
+local function IsQuestPanelVisible()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local mainGui = playerGui and playerGui:FindFirstChild("Main")
+    local questGui = mainGui and mainGui:FindFirstChild("Quest")
+    return questGui and questGui:IsA("GuiObject") and questGui.Visible == true
+end
+
 GetQuestData = function()
-	return QuestController.CurrentQuest ~= ""
+    if QuestController.CurrentQuest ~= "" then
+        return true
+    end
+    -- GuideModule can retain LAST quest after completion. Trust that data
+    -- only if the mission UI is actually visible to the player.
+    return IsQuestPanelVisible() and ReadGuideQuest() ~= nil or false
 end
 
 local function GetLastQuest()
@@ -1360,12 +1402,18 @@ local function GetBestQuest()
 		if table.find({ "BartiloQuest", "Trainees", "MarineQuest", "CitizenQuest", }, tostring(rnq)) then
 			continue
 		end
-		for ridq, ct in v do
-			if ct.LevelReq < 0 or LocalPlayer.Data.Level.Value < ct.LevelReq then
+        if type(v) ~= "table" then
+            continue
+        end
+		for ridq, ct in pairs(v) do
+            if type(ct) ~= "table" or type(ct.LevelReq) ~= "number"
+                or type(ct.Task) ~= "table" or ct.LevelReq < 0
+                or LocalPlayer.Data.Level.Value < ct.LevelReq then
 				continue
 			end
-			for O, taskValue in ct.Task do
-				if taskValue > 1 and ct.LevelReq > bestLevelReq then
+			for O, taskValue in pairs(ct.Task) do
+				if type(taskValue) == "number" and taskValue > 1
+                and ct.LevelReq > bestLevelReq then
 					bestLevelReq = ct.LevelReq
 					bestRnq = rnq
 					bestTaskName = tostring(O)
@@ -1385,7 +1433,7 @@ GetQuest = function()
 	local msn, nq, idq
 	local min = 0
 	if Level >= 275 and Level < 300 then
-		nq, msn, idq = "ColosseumQuest", "Togga Warrior", 1
+		nq, msn, idq = "ColosseumQuest", "Gladiator", 2
 	elseif Level >= 1450 and World.Sea2() then
 		nq, msn, idq = "ForgottenQuest", "Water Fighter", 2
 	elseif Level >= 700 and World.Sea1() then
@@ -1394,26 +1442,6 @@ GetQuest = function()
 		min, nq, msn, idq = GetBestQuest()
 	end
 	local q = {}
-	if Level >= 10 and not GetQuestData() and GetLastQuest() == msn then
-		for rnq, v in QuestController.CachedQuestData do
-			for _, N in v do
-				for x, _ in N.Task do
-					if tostring(x) == msn then
-						for iq, v2 in v do
-							for n, ct in v2.Task do
-								if n ~= msn and ct > 1 then
-									q.NameMonster = v2.LevelReq <= Level and tostring(n) or msn
-									q.NameQuest = v2.LevelReq <= Level and rnq or nq
-									q.ID = v2.LevelReq <= Level and iq or idq
-									return q
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-	end
 	q.NameMonster = msn
 	q.NameQuest = nq
 	q.ID = idq
@@ -1517,6 +1545,10 @@ local function GetActiveQuestMobName()
     if current and current ~= "" then
         return tostring(current)
     end
+    local guideMob = IsQuestPanelVisible() and ReadGuideQuest() or nil
+    if guideMob then
+        return guideMob
+    end
     local quest = GetQuest()
     return quest and quest.NameMonster or nil
 end
@@ -1541,47 +1573,122 @@ local function FindActiveQuestEnemy()
     return closest
 end
 
-local function FindActiveQuestSpawn()
+-- Determina locais de spawn nos 3 Seas a partir dos marcadores reais do jogo.
+-- Somente NPCs em workspace.Enemies sao tratados como alvos vivos.
+local function GetSpawnMarkerPosition(marker)
+    if marker:IsA("Attachment") then
+        return marker.WorldPosition
+    elseif marker:IsA("BasePart") or marker:IsA("Model") then
+        return marker:GetPivot().Position
+    end
+    return nil
+end
+
+local function GetQuestSpawnCandidates()
     local target = NormalizeQuestMobName(GetActiveQuestMobName())
+    local candidates, signatures = {}, {}
     if target == "" then
-        return nil
+        return candidates
+    end
+    local function add(position, source)
+        if typeof(position) ~= "Vector3" then return end
+        if position.Magnitude > 100000 then return end
+        local key = string.format("%d:%d:%d", math.floor(position.X / 12), math.floor(position.Y / 12), math.floor(position.Z / 12))
+        if signatures[key] then return end
+        signatures[key] = true
+        candidates[#candidates+1] = {Position = position, Source = source}
     end
 
-    local spawnFolder = ReplicatedStorage:FindFirstChild("FortBuilderReplicatedSpawnPositionsFolder")
-    local worldOrigin = workspace:FindFirstChild("_WorldOrigin")
-    local enemySpawns = worldOrigin and worldOrigin:FindFirstChild("EnemySpawns")
-    local nearest, shortestDistance = nil, math.huge
-    for _, folder in {spawnFolder, enemySpawns} do
+    local origin = workspace:FindFirstChild("_WorldOrigin")
+    local folders = {}
+    local replicatedSpawns = ReplicatedStorage:FindFirstChild("FortBuilderReplicatedSpawnPositionsFolder")
+    local worldSpawns = origin and origin:FindFirstChild("EnemySpawns")
+    if replicatedSpawns then folders[#folders + 1] = replicatedSpawns end
+    if worldSpawns then folders[#folders + 1] = worldSpawns end
+    for _, folder in ipairs(folders) do
         if folder then
-            for _, marker in folder:GetChildren() do
+            -- GetDescendants also finds spawn markers nested inside folders.
+            for _, marker in ipairs(folder:GetDescendants()) do
                 if NormalizeQuestMobName(marker.Name) == target then
-                    local ok, markerPosition = pcall(function()
-                        if marker:IsA("Attachment") then
-                            return marker.WorldPosition
-                        elseif marker:IsA("Model") or marker:IsA("BasePart") then
-                            return marker:GetPivot().Position
-                        end
-                    end)
-                    if ok and markerPosition then
-                        local dist = LocalPlayer:DistanceFromCharacter(markerPosition)
-                        if dist < shortestDistance then
-                            nearest, shortestDistance = markerPosition, dist
-                        end
-                    end
+                    local ok, position = pcall(GetSpawnMarkerPosition, marker)
+                    if ok then add(position, "marker") end
                 end
             end
         end
     end
-    if nearest then
-        return nearest
+
+    -- Only use stored mob model as a navigation hint, never as a live enemy.
+    -- Discard models at origin (0,0,0) and unrelated/out-of-region templates.
+    if #candidates == 0 then
+        local q = GetQuest()
+        local questNpcPos = q and q.NameQuest and GetQuestPosition(q.NameQuest)
+        for _, model in ipairs(ReplicatedStorage:GetChildren()) do
+            if model:IsA("Model") and NormalizeQuestMobName(model.Name) == target then
+                local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+                if root and root.Position.Magnitude > 250
+                    and (not questNpcPos or (root.Position - questNpcPos).Magnitude < 3000) then
+                    add(root.Position, "template")
+                end
+            end
+        end
     end
 
-    -- Ponto ja usado pela propria rotina CDK para o Mythological Pirate.
-    -- Ajuda quando os marcadores do mapa nao estao replicados no cliente.
-    if World.Sea3() and target == "mythological pirate" then
-        return Vector3.new(-13239, 520, -6813)
+    -- Reference from existing CDK logic; this is not a universal map lookup.
+    if #candidates == 0 and World.Sea3() and target == "mythological pirate" then
+        local base = Vector3.new(-13239, 520, -6813)
+        add(base, "cdk-reference")
+        for _, offset in ipairs({
+            Vector3.new(90, 0, 0), Vector3.new(0, 0, 90),
+            Vector3.new(-90, 0, 0), Vector3.new(0, 0, -90),
+            Vector3.new(185, 0, 0), Vector3.new(0, 0, 185),
+            Vector3.new(-185, 0, 0), Vector3.new(0, 0, -185),
+        }) do
+            add(base + offset, "cdk-search")
+        end
     end
-    return nil
+
+    -- When markers aren't replicated (streaming), search around quest NPC.
+    -- Rotate waypoints instead of waiting endlessly at one coordinate.
+    if #candidates == 0 then
+        local quest = GetQuest()
+        local base = quest and quest.NameQuest and GetQuestPosition(quest.NameQuest)
+        if base then
+            for _, offset in ipairs({
+                Vector3.new(110, 0, 0), Vector3.new(0, 0, 110),
+                Vector3.new(-110, 0, 0), Vector3.new(0, 0, -110),
+                Vector3.new(250, 0, 0), Vector3.new(0, 0, 250),
+                Vector3.new(-250, 0, 0), Vector3.new(0, 0, -250),
+            }) do
+                add(base + offset, "quest-area")
+            end
+        end
+    end
+    table.sort(candidates, function(a, b)
+        return LocalPlayer:DistanceFromCharacter(a.Position) < LocalPlayer:DistanceFromCharacter(b.Position)
+    end)
+    return candidates
+end
+
+local FarmWaypointIndex, FarmWaypointTarget, FarmWaypointUntil = 1, nil, 0
+local function SelectQuestWaypoint()
+    local target = NormalizeQuestMobName(GetActiveQuestMobName())
+    if FarmWaypointTarget ~= target then
+        FarmWaypointTarget, FarmWaypointIndex, FarmWaypointUntil = target, 1, 0
+    end
+    local candidates = GetQuestSpawnCandidates()
+    if #candidates == 0 then return nil, 0 end
+    if tick() >= FarmWaypointUntil then
+        if FarmWaypointUntil ~= 0 then
+            FarmWaypointIndex = FarmWaypointIndex % #candidates + 1
+        end
+        FarmWaypointIndex = math.clamp(FarmWaypointIndex, 1, #candidates)
+        -- Long trips get time to finish; otherwise the next waypoint
+        -- can be selected in mid-flight (back-and-forth movement).
+        local travelDistance = LocalPlayer:DistanceFromCharacter(candidates[FarmWaypointIndex].Position)
+        FarmWaypointUntil = tick() + math.clamp(travelDistance / 240 + 12, 14, 70)
+    end
+    FarmWaypointIndex = math.clamp(FarmWaypointIndex, 1, #candidates)
+    return candidates[FarmWaypointIndex], #candidates
 end
 
 local function LoadItem(v, t)
@@ -2582,176 +2689,102 @@ local function CheckDataLevel()
 		return 4
 	end
 end
+-- Mesma rotina de quests para Sea 1, Sea 2 e Sea 3; sem mobs fixos
+-- para faixas de nivel (Shanda/God's Guard eram incorretos para lv 10-119).
 local function FarmLevelLogic()
-	local levelData = CheckDataLevel()
-    LogChange("farm_band", "farm: level band " .. tostring(levelData))
-	if levelData == 2 then
-        LogChange("farm_target", "farm: targeting shanda")
-        SetStatus("farm | targeting shanda | lv " .. tostring(LocalPlayer.Data.Level.Value))
-		local foundMob = false
-		for _, v in {workspace.Enemies, ReplicatedStorage} do
-			for _, v2 in v:GetChildren() do
-				if v2:IsA("Model") then
-					local hrp = v2:FindFirstChild("HumanoidRootPart") or v2.PrimaryPart
-					if v2.Name == "Shanda" and hrp and v2:FindFirstChildOfClass("Humanoid") and v2:FindFirstChildOfClass("Humanoid").Health > 0 then
-						foundMob = true
-						repeat
-							task.wait()
-							local t = Tween(hrp.Position + Vector3.new(0, 20, 5), 350)
-							if LocalPlayer:DistanceFromCharacter(hrp.Position) <= 160 then
-								if t then
-									t:Cancel()
-								end
-								Tween(hrp.Position + Vector3.new(0, 20, 5), math.huge)
-								if LocalPlayer:DistanceFromCharacter(hrp.Position) <= 40 then
-									BringMob(v2.Name)
-									EquipWeapon()
-									Attack()
-								end
-							end
-						until not v2 or not v2:FindFirstChildOfClass("Humanoid") or v2.Humanoid.Health == 0
-						pcall(function()
-							v2:Destroy()
-						end)
-						if not CheckMonster("Shanda") then
-							break
-						end
-					end
-				end
-			end
-			if foundMob then
-				break
-			end
-		end
-		if not foundMob then
-			local n = ReplicatedStorage.FortBuilderReplicatedSpawnPositionsFolder:FindFirstChild("Shanda")
-			if n then
-				Tween(n:GetPivot().Position + Vector3.new(0, 25, 0), 350).Completed:Wait()
-			end
-		end
-	elseif levelData == 3 then
-        LogChange("farm_target", "farm: targeting god's guard")
-        SetStatus("farm | targeting god's guard | lv " .. tostring(LocalPlayer.Data.Level.Value))
-		local foundMob = false
-		for _, v in {workspace.Enemies, ReplicatedStorage} do
-			for _, v2 in v:GetChildren() do
-				if v2:IsA("Model") then
-					local hrp = v2:FindFirstChild("HumanoidRootPart") or v2.PrimaryPart
-					if v2.Name == "God's Guard" and hrp and v2:FindFirstChildOfClass("Humanoid") and v2:FindFirstChildOfClass("Humanoid").Health > 0 then
-						foundMob = true
-						repeat
-							task.wait()
-							local t = Tween(hrp.Position + Vector3.new(0, 25, 5), 350)
-							if LocalPlayer:DistanceFromCharacter(hrp.Position) <= 160 then
-								if t then
-									t:Cancel()
-								end
-								Tween(hrp.Position + Vector3.new(0, 25, 5), math.huge)
-								if LocalPlayer:DistanceFromCharacter(hrp.Position) <= 40 then
-									BringMob(v2.Name)
-									EquipWeapon()
-									Attack()
-								end
-							end
-						until not v2
-							or not v2.Parent
-							or not v2:FindFirstChildOfClass("Humanoid")
-							or v2:FindFirstChildOfClass("Humanoid").Health <= 0
-							or not v2.Name:find("God's Guard")
-						pcall(function()
-							v2:Destroy()
-						end)
-						if not CheckMonster("God's Guard") then
-							break
-						end
-					end
-				end
-			end
-			if foundMob then
-				break
-			end
-		end
-		if not foundMob then
-			local n = ReplicatedStorage.FortBuilderReplicatedSpawnPositionsFolder:FindFirstChild("God's Guard")
-			if n then
-				Tween(n:GetPivot().Position + Vector3.new(0, 25, 0), 350).Completed:Wait()
-			end
-		end
-    elseif levelData == 4 or levelData == 1 then
-        local enemy = FindActiveQuestEnemy()
-        if enemy then
-            LogChange("farm_target", "farm: targeting quest mob " .. tostring(GetActiveQuestMobName()))
-            SetStatus("farm | defeating quest mob | lv " .. tostring(LocalPlayer.Data.Level.Value))
-            local humanoid = enemy:FindFirstChildOfClass("Humanoid")
-            local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
-            local deadline = tick() + 75
-            local nextMove = 0
-            while enemy.Parent == workspace.Enemies and humanoid and humanoid.Parent
-                and humanoid.Health > 0 and root and root.Parent and tick() < deadline do
-                TakeQuest()
-                local distance = LocalPlayer:DistanceFromCharacter(root.Position)
-                if distance > 38 and tick() >= nextMove then
-                    Tween(root.Position + Vector3.new(0, 20, 5), 350)
-                    nextMove = tick() + math.clamp(distance / 350, 0.5, 3)
-                elseif distance <= 48 then
-                    BringMob(enemy.Name)
-                    EquipWeapon()
-                    Attack()
-                end
-                task.wait(0.15)
-            end
-            if enemy.Parent and humanoid and humanoid.Health > 0 and tick() >= deadline then
-                LogChange("farm_mob_timeout", "farm: target timeout; looking for another mob")
-            end
-        else
-            -- Antes, sem inimigos carregados, somente procurava marcadores
-            -- com nome EXATAMENTE igual a CurrentQuest. Se nao houvesse
-            -- nenhum, ficava no ar sem navegar para a ilha do monstro.
-            TakeQuest()
-            if not GetQuestData() then
-                LogChange("farm_target", "farm: waiting for quest to start")
-                SetStatus("farm | waiting for quest start | lv " .. tostring(LocalPlayer.Data.Level.Value))
-                task.wait(0.8)
-                return
-            end
+    local level = LocalPlayer.Data.Level.Value
+    local questName = tostring(GetActiveQuestMobName() or "")
+    if questName == "" then
+        LogChange("farm_no_quest", "farm: unable to select a level quest at lv " .. level)
+        SetStatus("farm | quest unavailable | lv " .. level)
+        task.wait(1)
+        return
+    end
 
-            local targetName = tostring(GetActiveQuestMobName() or "unknown")
-            local spawnPosition = FindActiveQuestSpawn()
-            if spawnPosition then
-                local destination = spawnPosition + Vector3.new(0, 25, 0)
-                local dist = LocalPlayer:DistanceFromCharacter(destination)
-                if dist > 95 then
-                    LogChange("farm_target", "farm: moving to " .. targetName .. " spawn")
-                    SetStatus("farm | going to quest mobs | lv " .. tostring(LocalPlayer.Data.Level.Value))
-                    local journey = Tween(destination, 350)
-                    if not journey then
-                        warn("[Zyon] farm: could not start movement to " .. targetName)
-                        task.wait(1)
-                        return
-                    end
-                    -- Inimigos podem aparecer durante o trajeto; reavaliar em
-                    -- vez de esperar cegamente um tween de longa distancia.
-                    local deadline = tick() + math.clamp(dist / 200 + 10, 10, 70)
-                    while tick() < deadline and GetQuestData()
-                        and LocalPlayer:DistanceFromCharacter(destination) > 95 do
-                        if FindActiveQuestEnemy() then
-                            break
-                        end
-                        task.wait(0.35)
-                    end
-                else
-                    LogChange("farm_target", "farm: waiting for " .. targetName .. " near spawn")
-                    SetStatus("farm | waiting for quest mob | lv " .. tostring(LocalPlayer.Data.Level.Value))
-                    task.wait(1.5)
+    -- On a fresh script start, QuestUpdate may not have been delivered yet.
+    -- GuideModule.QuestData serves as a second authoritative client source.
+    if not GetQuestData() then
+        LogChange("farm_quest", "farm: acquiring quest for " .. questName)
+        SetStatus("farm | taking quest | lv " .. level)
+        TakeQuest()
+        if not GetQuestData() then
+            SetStatus("farm | waiting for quest | lv " .. level)
+            task.wait(0.6)
+            return
+        end
+    end
+
+    local enemy = FindActiveQuestEnemy()
+    if enemy then
+        LogChange("farm_target", "farm: fighting " .. questName)
+        SetStatus("farm | defeating " .. questName .. " | lv " .. level)
+        local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+        local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+        local deadline = tick() + 55
+        local nextMove, lastDistance, stalledSince = 0, math.huge, tick()
+        while enemy.Parent == workspace.Enemies and humanoid and humanoid.Parent and humanoid.Health > 0
+            and root and root.Parent and GetQuestData() and tick() < deadline do
+            local dist = LocalPlayer:DistanceFromCharacter(root.Position)
+            if dist + 12 < lastDistance then stalledSince = tick() end
+            lastDistance = dist
+            if dist > 32 then
+                if tick() >= nextMove then
+                    local newTween = Tween(root.Position + Vector3.new(0, 18, 5), 350)
+                    if not newTween then break end
+                    nextMove = tick() + math.clamp(dist / 350, 0.7, 3)
+                end
+                if tick() - stalledSince > 12 then
+                    LogChange("farm_movement", "farm: stalled approaching " .. questName .. "; retrying")
+                    StopTween()
+                    break
                 end
             else
-                LogChange("farm_missing_spawn", "farm: no spawn marker for " .. targetName)
-                SetStatus("farm | spawn not found: " .. targetName)
-                warn("[Zyon] farm: spawn location missing for " .. targetName)
-                task.wait(2)
+                stalledSince = tick()
+                -- Can attack only actual mobs in workspace.Enemies.
+                BringMob(enemy.Name)
+                EquipWeapon()
+                Attack()
             end
+            task.wait(0.18)
         end
-	end
+        if enemy.Parent and humanoid and humanoid.Health > 0 and tick() >= deadline then
+            warn("[Zyon] farm: timed out on " .. questName .. "; reassessing")
+        end
+        return
+    end
+
+    -- No mobs loaded: travel to spawn markers (even nested), then rotate
+    -- between points to force streaming of nearby enemies.
+    local waypoint, waypointCount = SelectQuestWaypoint()
+    if not waypoint then
+        LogChange("farm_no_spawn", "farm: no location for " .. questName)
+        SetStatus("farm | spawn missing: " .. questName)
+        warn("[Zyon] farm: no marker, template or quest NPC for " .. questName)
+        task.wait(2)
+        return
+    end
+    local destination = waypoint.Position + Vector3.new(0, 20, 0)
+    local distance = LocalPlayer:DistanceFromCharacter(destination)
+    if distance > 42 then
+        LogChange("farm_target", "farm: going to " .. questName .. " spawn (" .. waypoint.Source .. ")")
+        SetStatus("farm | going to quest mobs | lv " .. level)
+        local journey = Tween(destination, 350)
+        if not journey then
+            warn("[Zyon] farm: unable to tween to " .. questName)
+            task.wait(0.8)
+            return
+        end
+        local deadline = math.min(FarmWaypointUntil, tick() + math.clamp(distance / 200 + 4, 7, 35))
+        while tick() < deadline and GetQuestData()
+            and LocalPlayer:DistanceFromCharacter(destination) > 42 do
+            if FindActiveQuestEnemy() then break end
+            task.wait(0.3)
+        end
+    else
+        LogChange("farm_target", "farm: scanning " .. questName .. " spawn " .. FarmWaypointIndex .. "/" .. waypointCount)
+        SetStatus("farm | searching " .. questName .. " | lv " .. level)
+        task.wait(1)
+    end
 end
 
 boneNPCs = {
@@ -3769,7 +3802,7 @@ local NextYamaAttempt = 0
 local function GetYama()
     LogChange("yama", "yama: moving to sealed katana")
     SetStatus("yama | going to sword")
-    NextYamaAttempt = tick() + 75
+    NextYamaAttempt = tick() + 180
 
     local map = workspace:FindFirstChild("Map")
     local waterfall = map and map:FindFirstChild("Waterfall")
@@ -3777,7 +3810,8 @@ local function GetYama()
     local hitbox = sealedKatana and sealedKatana:FindFirstChild("Hitbox")
     local detector = hitbox and hitbox:FindFirstChildOfClass("ClickDetector")
     if not hitbox or not hitbox:IsA("BasePart") or not detector or not fireclickdetector then
-        warn("[Zyon] Yama: sword or click detector not available; retrying later")
+        NextYamaAttempt = tick() + 600
+        warn("[Zyon] Yama: sword/click detector unavailable; farming for 10min before retry")
         return false
     end
 
@@ -3981,10 +4015,11 @@ end)
 print("initialized")
 task.spawn(function()
     print("main loop started")
-	while task.wait() do
-		if MeleeKaitunLogic() then
-			continue
-		end
+	while task.wait(0.15) do
+        local mainOk, mainErr = pcall(function()
+            if MeleeKaitunLogic() then
+                return
+            end
 		if Config.CursedDualKatana and (function() local b = 0 for i in {"Tushita", "Yama"} do if CheckItem(i) then
 						LoadItem(i, "Sword")
 						for _, v in {LocalPlayer.Backpack, Character} do
@@ -4168,5 +4203,11 @@ task.spawn(function()
                 end
 			end
 		end
+        end)
+        if not mainOk then
+            LogChange("main_error", "main: recovered from error " .. tostring(mainErr))
+            warn("[Zyon] main loop: " .. tostring(mainErr))
+            task.wait(1)
+        end
 	end
 end)

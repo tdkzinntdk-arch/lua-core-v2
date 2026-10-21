@@ -1472,64 +1472,62 @@ local function QuestNpcDistance(position)
 end
 
 local function ApproachQuestNpc(position, questName)
-    -- Primeiro usa a rota normal (incluindo as entradas/atalhos por Sea).
-    -- O resultado booleano do tween NAO substitui a distancia real.
-    local travelOk = TweenWithRespawnRetry(position, 350)
-    task.wait(0.35)
-    local remaining = QuestNpcDistance(position)
-    if remaining <= QUEST_NPC_RADIUS then return true end
+    -- NAO comecar uma tween gigante: o cliente pode completar o Tween,
+    -- mas o servidor devolver a posicao. A cada trecho verificamos a
+    -- distancia REAL apos estabilizacao; nenhum 'Completed' conta como chegada.
+    local startDistance = QuestNpcDistance(position)
+    if startDistance <= QUEST_NPC_RADIUS then return true end
 
-    warn(string.format(
-        "[Zyon] quest: initial travel %s but npc still %.1f studs away (%s); trying short segments",
-        travelOk and "completed" or "failed/cancelled", remaining, tostring(questName)))
-    LogChange("quest_retry", "quest: correcting route to " .. tostring(questName))
-    SetStatus("quest | correcting route: " .. tostring(questName))
+    LogChange("quest_retry", string.format("quest: route to %s, %.0f studs", tostring(questName), startDistance))
+    SetStatus("quest | traveling to " .. tostring(questName))
 
-    -- Trechos curtos reduzem os efeitos de reposicionamento do personagem,
-    -- sem forçar teleporte instantaneo e sem mudar o movimento da raid.
-    local overallDeadline = tick() + 75
-    local stalledLegs = 0
-    for leg = 1, 12 do
-        if tick() >= overallDeadline then break end
+    local deadline = tick() + math.clamp(startDistance / 160 + 32, 42, 115)
+    local stalls = 0
+    local lastLog = 0
+    for leg = 1, 32 do
+        if tick() >= deadline then break end
         if GetQuestData() then return true end
-        local character, humanoid, root = WaitForAliveCharacter(8)
+        local character, humanoid, root = WaitForAliveCharacter(6)
         if not character or not humanoid or not root then return false end
         local origin = root.Position
-        remaining = (origin - position).Magnitude
-        if remaining <= QUEST_NPC_RADIUS then return true end
+        local before = (origin - position).Magnitude
+        if before <= QUEST_NPC_RADIUS then return true end
 
-        local stepDistance = math.min(500, remaining)
-        local destination = origin + (position - origin).Unit * stepDistance
-        local motion = RunTween(destination, nil, 250)
+        local step = math.min(450, before)
+        local destination = origin + (position - origin).Unit * step
+        local motion = RunTween(destination, nil, 300)
         if not motion then
-            warn("[Zyon] quest: could not begin movement segment " .. leg)
+            warn("[Zyon] quest: movement segment could not start, npc=" .. tostring(questName))
             break
         end
-        local segmentDeadline = math.min(overallDeadline, tick() + stepDistance / 250 + 4)
-        local startDistance = remaining
-        while tick() < segmentDeadline and QuestNpcDistance(position) > QUEST_NPC_RADIUS do
-            if motion.PlaybackState == Enum.PlaybackState.Cancelled then break end
-            if motion.PlaybackState == Enum.PlaybackState.Completed then break end
-            if not character.Parent or humanoid.Health <= 0 then break end
-            task.wait(0.15)
+        local legDeadline = math.min(deadline, tick() + step / 300 + 3)
+        while tick() < legDeadline do
+            if motion.PlaybackState ~= Enum.PlaybackState.Playing then break end
+            if not root.Parent or humanoid.Health <= 0 then break end
+            task.wait(0.14)
         end
         if motion.PlaybackState == Enum.PlaybackState.Playing then
             pcall(function() motion:Cancel() end)
         end
-        task.wait(0.25) -- detecta correção/reversão de posição pelo servidor
-        local afterDistance = QuestNpcDistance(position)
-        LogChange("quest_segment", string.format("quest: segment %d, npc distance %.0f", leg, afterDistance))
-        if afterDistance <= QUEST_NPC_RADIUS then return true end
-        if afterDistance >= startDistance - 20 then
-            stalledLegs = stalledLegs + 1
-            warn(string.format("[Zyon] quest: segment %d made no progress (%.1f -> %.1f studs); tween=%s",
-                leg, startDistance, afterDistance, tostring(motion.PlaybackState)))
-            if stalledLegs >= 2 then break end
+        task.wait(0.22)
+        local after = QuestNpcDistance(position)
+        if after <= QUEST_NPC_RADIUS then return true end
+        if tick() - lastLog >= 3 then
+            LogChange("quest_segment", string.format(
+                "quest: progress to %s, leg %d, remaining %.0f", tostring(questName), leg, after))
+            lastLog = tick()
+        end
+        if after >= before - 15 then
+            stalls = stalls + 1
+            warn(string.format(
+                "[Zyon] quest: stalled leg %d, npc=%s %.0f -> %.0f; state=%s",
+                leg, tostring(questName), before, after, tostring(motion.PlaybackState)))
+            if stalls >= 3 then break end
         else
-            stalledLegs = 0
+            stalls = 0
         end
     end
-    warn(string.format("[Zyon] quest: could not reach npc=%s; remaining=%.1f; %s",
+    warn(string.format("[Zyon] quest: unable to reach npc=%s; remaining=%.1f; %s",
         tostring(questName), QuestNpcDistance(position), QuestStateDiagnostics()))
     return false
 end
@@ -1568,7 +1566,8 @@ local function TakeQuest()
     if not arrived or distance > QUEST_NPC_RADIUS then
         warn(string.format("[Zyon] quest: unable to approach npc=%s; distance=%.1f; target=(%.0f,%.0f,%.0f)",
             tostring(q.NameQuest), distance, questPos.X, questPos.Y, questPos.Z))
-        lastTakeQuest = tick() + 6
+        -- Falhas longas nao devem reiniciar outra viagem imediatamente.
+        lastTakeQuest = tick() + 18
         return
     end
 
@@ -1748,7 +1747,14 @@ GetQuest = function()
 	local Level = LocalPlayer.Data.Level.Value
 	local msn, nq, idq
 	local min = 0
-	if Level >= 275 and Level < 300 then
+	-- HauntedQuest2 compartilha o NPC, mas os IDs representam ALVOS diferentes.
+	-- Algumas versoes da tabela CachedQuestData agrupam os dois Tasks sob
+	-- LevelReq=2025; o seletor generico escolhia Mummy cedo demais.
+	if World.Sea3() and Level >= 2025 and Level <= 2049 then
+		nq, msn, idq = "HauntedQuest2", "Demonic Soul", 1
+	elseif World.Sea3() and Level >= 2050 and Level <= 2074 then
+		nq, msn, idq = "HauntedQuest2", "Posessed Mummy", 2
+	elseif Level >= 275 and Level < 300 then
 		nq, msn, idq = "ColosseumQuest", "Gladiator", 2
 	elseif Level >= 1450 and World.Sea2() then
 		nq, msn, idq = "ForgottenQuest", "Water Fighter", 2
@@ -1889,6 +1895,26 @@ local function LevelQuestMatches()
         and currentInternalName:lower() ~= tostring(desired.NameQuest or ""):lower()
     if expectedMonster == actualMonster and not wrongQuestName then
         return true
+    end
+    -- Nao abandonar quest valida ainda em progresso no MESMO NPC.
+    -- Concluir a missao ja aceita e melhor que cancelar no meio do combate.
+    if currentInternalName ~= "" and not wrongQuestName
+        and actualMonster ~= "" then
+        local questVariants = QuestController.CachedQuestData[desired.NameQuest]
+        if type(questVariants) == "table" then
+            for _, variant in pairs(questVariants) do
+                if type(variant) == "table" and type(variant.Task) == "table"
+                    and type(variant.LevelReq) == "number"
+                    and LocalPlayer.Data.Level.Value >= variant.LevelReq then
+                    for mobName in pairs(variant.Task) do
+                        if NormalizeQuestMobName(mobName) == actualMonster then
+                            LogChange("farm_existing_quest", "farm: finishing valid active quest: " .. tostring(actual))
+                            return true
+                        end
+                    end
+                end
+            end
+        end
     end
     if tick() >= NextLevelQuestReset then
         NextLevelQuestReset = tick() + 12
@@ -3081,6 +3107,9 @@ local function FarmLevelLogic()
         end
     end
 
+    -- Caso uma variante valida ja esteja ativa, use seu monstro real.
+    -- Isso evita status e alvo trocados ao completar a quest anterior.
+    questName = tostring(GetActiveQuestMobName() or questName)
     local enemy = FindActiveQuestEnemy()
     if enemy then
         LogChange("farm_target", "farm: fighting " .. questName)
@@ -5060,27 +5089,39 @@ local function FruitSpinDue()
 end
 
 local function RollFruitOnce()
-    -- Blox Fruit Gacha / Zioles: Cousin Buy, cooldown ~2 horas.
-    -- DLCBoxData e consulta, NAO compra a fruta!
-    FruitSpinNext = tick() + 300 -- anti-duplicacao mesmo com resposta desconhecida
+    -- Zioles / Gacha aleatorio: nao confundir 'Cousin' com compra no Dealer.
+    -- O servidor pode retornar nil durante cooldown, indisponibilidade ou
+    -- protocolo alterado. Nunca declarar compra bem-sucedida sem evidencias.
+    FruitSpinNext = tick() + 600 -- no minimo 10min quando a compra NAO for confirmada
     SetStatus("fruits | rolling at zioles")
-    LogChange("fruit_spin", "fruit: Zioles GACHA (random fruit), sending Cousin/Buy; NOT Blox Fruit Dealer")
-    local previousMoney = LocalPlayer.Data.Beli.Value
+    local moneyBefore = LocalPlayer.Data.Beli.Value
+    local checkOk, checkResult = pcall(function()
+        return CommF_:InvokeServer("Cousin", "Check")
+    end)
+    if not checkOk then
+        warn("[Zyon] fruit: Zioles Check failed: " .. tostring(checkResult) .. "; retry >=10min")
+        return
+    end
+    LogChange("fruit_gacha_check", "fruit: Zioles Check => " .. tostring(checkResult))
+
+    LogChange("fruit_spin", "fruit: Zioles GACHA - Cousin/Buy (random fruit)")
     local ok, response = pcall(function()
         return CommF_:InvokeServer("Cousin", "Buy")
     end)
     if not ok then
-        warn("[Zyon] fruit: gacha purchase failed: " .. tostring(response))
+        warn("[Zyon] fruit: Zioles Buy failed: " .. tostring(response) .. "; retry >=10min")
         return
     end
-    task.wait(1.5)
-    local spent = math.max(0, previousMoney - LocalPlayer.Data.Beli.Value)
+    task.wait(2)
+    local spent = math.max(0, moneyBefore - LocalPlayer.Data.Beli.Value)
     if spent > 0 then
         FruitSpinNext = tick() + math.max(7200, tonumber(Config.FruitSpinInterval) or 7200)
-        LogChange("fruit_spin", string.format("fruit: Zioles GACHA payment confirmed (Beli spent: %d); next roll in >=2h", spent))
-        return
+        LogChange("fruit_spin", string.format("fruit: Zioles CONFIRMED (spent %d Beli); next >=2h", spent))
+    else
+        warn("[Zyon] fruit: Zioles UNCONFIRMED; Check=" .. tostring(checkResult)
+            .. "; Buy=" .. tostring(response)
+            .. "; Beli unchanged; next check >=10min")
     end
-    warn("[Zyon] fruit: Zioles gacha returned " .. tostring(response) .. "; Beli did not change, purchase NOT confirmed; retrying later")
 end
 
 local CASTLE_EVENT_POS = Vector3.new(-5000, 350, -3035)

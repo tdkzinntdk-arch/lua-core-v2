@@ -5047,6 +5047,12 @@ end
 -- A raid de microchip continua no arquivo, mas NAO inicia por padrao:
 -- Factory Raid e Pirate Raid do Castelo sao EVENTOS, nao raid de microchip.
 -- ============================================================================
+-- Escopo separado: o script principal ja usa quase 200 registradores locais.
+-- Em Luau, novas declaracoes `local` no mesmo chunk causavam erro de
+-- compilacao ("Out of local registers" em DARK_ARENA_EVENT_POS).
+-- Esta funcao cria outro quadro de registradores, mantendo os acessos aos
+-- helpers acima como upvalues e preservando o controlador unico de prioridades.
+(function()
 local PriorityWorker, PriorityMode, PriorityTarget = nil, nil, nil
 local PriorityWorkerStarted = 0
 local FruitRetryAfter = setmetatable({}, {__mode="k"})
@@ -5673,3 +5679,4 @@ task.spawn(function()
         end
     end
 end)
+end)()

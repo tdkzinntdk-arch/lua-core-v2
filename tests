@@ -3505,77 +3505,153 @@ AutoDungeon = function()
         LogChange("raid_state", RaidController.isRaiding and "raid: started" or "raid: join timed out")
         SetStatus(RaidController.isRaiding and "raid | started" or "raid | join timed out")
 		task.wait(0.5)
-		while RaidController.isRaiding do
-            LogChange("raid_state", "raid: clearing island")
-			SetStatus("raid | clearing island")
-			for _, v in workspace.Enemies:GetChildren() do
-				if v.PrimaryPart and v:FindFirstChildOfClass("Humanoid") and v:FindFirstChildOfClass("Humanoid").Health > 0 and LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position) <= 2000 then
-					repeat
-						task.wait()
-						pcall(sethiddenproperty, LocalPlayer, "SimulationRadius", math.huge)
-						pcall(function()
-							Tween(v.PrimaryPart.Position + Vector3.new(0, 28, 15), 350)
-							if LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position) <= 200 then
-								Tween(v.PrimaryPart.Position + Vector3.new(0, 28, 15), math.huge)
-								if LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position) <= 50 then
-									EquipWeapon()
-									Attack()
-								end
-							end
-						end)
-					until not v
-						or not v.PrimaryPart
-						or not v:FindFirstChildOfClass("Humanoid")
-						or v:FindFirstChildOfClass("Humanoid").Health == 0
-					break
-				end
-			end
-			local found = false
-			for i = 5, 1, -1 do
-				for _, z in workspace["_WorldOrigin"].Locations:GetChildren() do
-					if z.Name == ("Island " .. i) and LocalPlayer:DistanceFromCharacter( workspace["_WorldOrigin"].Locations["Island " .. i]:GetPivot().Position ) <= 6000 then
-                        LogChange("raid_island", "raid: moving to island " .. tostring(i))
-                        SetStatus("raid | moving to island " .. tostring(i))
-						found = true
-						Tween( workspace["_WorldOrigin"].Locations["Island " .. i]:GetPivot() * CFrame.new(100, 70, 100), 350 )
-						task.wait(0.5)
-						break
-					end
-				end
-				if found then
-					break
-				end
-			end
-			task.wait()
-		end
+        local raidIslandIndex = 1
+        local lastEnemySeen = tick()
+        while RaidController.isRaiding do
+            -- Segue Ilha 1 -> 5 em ordem, sem saltar direto para a ultima ilha
+            -- simplesmente porque ela ja apareceu no mapa.
+            local worldOrigin = workspace:FindFirstChild("_WorldOrigin")
+            local locations = worldOrigin and worldOrigin:FindFirstChild("Locations")
+            local activeIsland = locations and locations:FindFirstChild("Island " .. raidIslandIndex)
+            if not activeIsland and locations then
+                for i = raidIslandIndex, 5 do
+                    local candidate = locations:FindFirstChild("Island " .. i)
+                    if candidate then
+                        raidIslandIndex, activeIsland = i, candidate
+                        break
+                    end
+                end
+            end
+
+            local nearestEnemy, nearestDist = nil, math.huge
+            for _, enemy in workspace.Enemies:GetChildren() do
+                local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+                local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+                if humanoid and humanoid.Health > 0 and root then
+                    local dist = LocalPlayer:DistanceFromCharacter(root.Position)
+                    if dist <= 2000 and dist < nearestDist then
+                        nearestEnemy, nearestDist = enemy, dist
+                    end
+                end
+            end
+
+            if nearestEnemy then
+                lastEnemySeen = tick()
+            elseif activeIsland and locations and raidIslandIndex < 5
+                and LocalPlayer:DistanceFromCharacter(activeIsland:GetPivot().Position) <= 120
+                and tick() - lastEnemySeen >= 4 then
+                local nextIsland = locations:FindFirstChild("Island " .. (raidIslandIndex + 1))
+                if nextIsland then
+                    raidIslandIndex = raidIslandIndex + 1
+                    activeIsland = nextIsland
+                    lastEnemySeen = tick()
+                    LogChange("raid_island", "raid: advancing to island " .. raidIslandIndex)
+                end
+            end
+
+            if nearestEnemy then
+                SetStatus("raid | defeating enemies | island " .. tostring(raidIslandIndex))
+                local humanoid = nearestEnemy:FindFirstChildOfClass("Humanoid")
+                local root = nearestEnemy:FindFirstChild("HumanoidRootPart") or nearestEnemy.PrimaryPart
+                local killDeadline = tick() + 25
+                local nextMove = 0
+                while RaidController.isRaiding and humanoid and humanoid.Parent and humanoid.Health > 0
+                    and root and root.Parent and tick() < killDeadline do
+                    local dist = LocalPlayer:DistanceFromCharacter(root.Position)
+                    if dist > 48 and tick() >= nextMove then
+                        Tween(root.Position + Vector3.new(0, 25, 8), 350)
+                        nextMove = tick() + math.clamp(dist / 350, 0.6, 4)
+                    elseif dist <= 65 then
+                        pcall(sethiddenproperty, LocalPlayer, "SimulationRadius", math.huge)
+                        EquipWeapon()
+                        Attack()
+                    end
+                    task.wait(0.15)
+                end
+                if humanoid and humanoid.Parent and humanoid.Health > 0 then
+                    LogChange("raid_enemy_timeout", "raid: enemy timeout; reevaluating")
+                end
+            elseif activeIsland and RaidController.isRaiding then
+                -- Apenas se desloca quando esta efetivamente longe da ilha atual.
+                -- Antes o loop voltava incessantemente para a mesma coordenada.
+                local destination = activeIsland:GetPivot().Position + Vector3.new(0, 42, 0)
+                if LocalPlayer:DistanceFromCharacter(destination) > 95 then
+                    SetStatus("raid | moving to island " .. tostring(raidIslandIndex))
+                    local move = Tween(destination, 350)
+                    if move then
+                        local deadline = tick() + 8
+                        while RaidController.isRaiding and tick() < deadline
+                            and LocalPlayer:DistanceFromCharacter(destination) > 95 do
+                            task.wait(0.2)
+                        end
+                    end
+                else
+                    SetStatus("raid | waiting for next wave")
+                    task.wait(0.4)
+                end
+            else
+                SetStatus("raid | waiting for island")
+                task.wait(0.4)
+            end
+            task.wait(0.1)
+        end
 	end
 	 task.wait(5)
     LogChange("raid_state", "raid: cycle ended")
 end
 
+-- Evita que uma tentativa sem sucesso monopolize o Kaitun a cada ciclo.
+local NextYamaAttempt = 0
 local function GetYama()
-    LogChange("yama", "yama: unlocking")
-    SetStatus("yama | unlocking")
-    local deadline = tick() + 120
-    repeat
-        local map = workspace:FindFirstChild("Map")
-        local waterfall = map and map:FindFirstChild("Waterfall")
-        local sealedKatana = waterfall and waterfall:FindFirstChild("SealedKatana")
-        local hitbox = sealedKatana and sealedKatana:FindFirstChild("Hitbox")
-        local detector = hitbox and hitbox:FindFirstChildOfClass("ClickDetector")
-        if detector and fireclickdetector then
-            pcall(fireclickdetector, detector)
-        else
-            warn("[Zyon] Yama click detector unavailable")
-            return false
-        end
-        task.wait(0.5)
-    until LocalPlayer.Backpack:FindFirstChild("Yama") or tick() >= deadline
-    if not LocalPlayer.Backpack:FindFirstChild("Yama") then
-        warn("[Zyon] Yama acquisition timed out after 120s")
+    LogChange("yama", "yama: moving to sealed katana")
+    SetStatus("yama | going to sword")
+    NextYamaAttempt = tick() + 75
+
+    local map = workspace:FindFirstChild("Map")
+    local waterfall = map and map:FindFirstChild("Waterfall")
+    local sealedKatana = waterfall and waterfall:FindFirstChild("SealedKatana")
+    local hitbox = sealedKatana and sealedKatana:FindFirstChild("Hitbox")
+    local detector = hitbox and hitbox:FindFirstChildOfClass("ClickDetector")
+    if not hitbox or not hitbox:IsA("BasePart") or not detector or not fireclickdetector then
+        warn("[Zyon] Yama: sword or click detector not available; retrying later")
         return false
     end
-    return true
+
+    -- O script antigo clicava de qualquer lugar sem se aproximar da espada.
+    if LocalPlayer:DistanceFromCharacter(hitbox.Position) > 18 then
+        local reached = TweenWithRespawnRetry(hitbox.Position + Vector3.new(0, 4, 0), 350)
+        if not reached or LocalPlayer:DistanceFromCharacter(hitbox.Position) > 25 then
+            warn("[Zyon] Yama: failed to reach sword; resuming Kaitun")
+            return false
+        end
+    end
+
+    LogChange("yama", "yama: interacting with sword")
+    SetStatus("yama | interacting")
+    local deadline = tick() + 18
+    repeat
+        if HasItem("Yama") or CheckItem("Yama") then
+            LogChange("yama", "yama: acquired")
+            return true
+        end
+        if LocalPlayer:DistanceFromCharacter(hitbox.Position) > 25 then
+            warn("[Zyon] Yama: character moved away; retrying later")
+            return false
+        end
+        local ok, err = pcall(fireclickdetector, detector)
+        if not ok then
+            warn("[Zyon] Yama click failed: " .. tostring(err))
+            return false
+        end
+        task.wait(0.75)
+    until tick() >= deadline or not RaidController or RaidController.isRaiding
+
+    if HasItem("Yama") or CheckItem("Yama") then
+        LogChange("yama", "yama: acquired")
+        return true
+    end
+    warn("[Zyon] Yama: no sword after interaction; will retry after cooldown")
+    return false
 end
 
 local function CheckTushita()
@@ -3874,7 +3950,7 @@ task.spawn(function()
 					Attack()
 				until coreEnemy.Humanoid.Health <= 0
 			end
-		elseif Config.CursedDualKatana and CheckYama() >= 30 and not CheckItem("Yama") then
+		elseif Config.CursedDualKatana and World.Sea3() and tick() >= NextYamaAttempt and CheckYama() >= 30 and not CheckItem("Yama") then
             LogChange("main_mode", "mode: get yama")
 			SetStatus("yama | unlocking")
 			GetYama()
@@ -3920,7 +3996,12 @@ task.spawn(function()
 			if LocalPlayer.Data.Level.Value == MaxLevel then
 				pcall(FarmKataLogic)
 			else
-				pcall(FarmLevelLogic)
+                local farmOk, farmErr = pcall(FarmLevelLogic)
+                if not farmOk then
+                    LogChange("farm_error", "farm: error " .. tostring(farmErr))
+                    warn("[Zyon] FarmLevelLogic: " .. tostring(farmErr))
+                    task.wait(1)
+                end
 			end
 		end
 	end

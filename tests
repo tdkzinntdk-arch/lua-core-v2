@@ -1702,6 +1702,10 @@ end
 local function GetBestQuest()
 	local bestLevelReq = -1
 	local bestRnq, bestTaskName, bestRidq = nil, nil, nil
+    -- QuestController.CachedQuestData inclui missoes dos tres Seas.
+    -- Sem o filtro, um personagem ainda no Sea 2 pode selecionar
+    -- uma quest de Sea 3 somente porque atende ao LevelReq.
+    local sea1, sea2, sea3 = World.Sea1(), World.Sea2(), World.Sea3()
 	for rnq, v in QuestController.CachedQuestData do
 		if table.find({ "BartiloQuest", "Trainees", "MarineQuest", "CitizenQuest", }, tostring(rnq)) then
 			continue
@@ -1715,6 +1719,14 @@ local function GetBestQuest()
                 or LocalPlayer.Data.Level.Value < ct.LevelReq then
 				continue
 			end
+            -- Requisitos oficiais de transicao de Sea (700/1500).
+            -- Os casos especiais Fountain/Forgotten ficam no GetQuest().
+            local questLevel = ct.LevelReq
+            if (sea1 and questLevel >= 700)
+                or (sea2 and (questLevel < 700 or questLevel >= 1500))
+                or (sea3 and questLevel < 1500) then
+                continue
+            end
 			for O, taskValue in pairs(ct.Task) do
 				if type(taskValue) == "number" and taskValue > 1
                 and ct.LevelReq > bestLevelReq then
@@ -1857,6 +1869,39 @@ local function GetActiveQuestMobName()
     return quest and quest.NameMonster or nil
 end
 
+-- Confirma que a missao ATIVA e a esperada para farmar nivel.
+-- GetQuestData() sozinho so informa que existe ALGUMA missao, inclusive
+-- uma antiga de outro NPC. Usar apenas o booleano trava o farm nesse caso.
+local NextLevelQuestReset = 0
+local function LevelQuestMatches()
+    if not GetQuestData() then return false end
+    local desired = GetQuest()
+    if not desired or not desired.NameMonster then return false end
+    local actual = QuestController.CurrentQuest
+    if actual == "" then
+        actual = IsQuestPanelVisible() and ReadGuideQuest() or nil
+    end
+    if not actual or actual == "" then return false end
+    local expectedMonster = NormalizeQuestMobName(desired.NameMonster)
+    local actualMonster = NormalizeQuestMobName(actual)
+    local currentInternalName = tostring(QuestController.CurrentQuestName or "")
+    local wrongQuestName = currentInternalName ~= ""
+        and currentInternalName:lower() ~= tostring(desired.NameQuest or ""):lower()
+    if expectedMonster == actualMonster and not wrongQuestName then
+        return true
+    end
+    if tick() >= NextLevelQuestReset then
+        NextLevelQuestReset = tick() + 12
+        warn(string.format("[Zyon] farm: unrelated quest active (mob=%s, internal=%s), expected=%s/%s; abandoning once",
+            tostring(actual), currentInternalName, tostring(desired.NameQuest), tostring(desired.NameMonster)))
+        local ok, err = pcall(function()
+            return CommF_:InvokeServer("AbandonQuest")
+        end)
+        if not ok then warn("[Zyon] farm: unable to abandon unrelated quest: " .. tostring(err)) end
+    end
+    return false
+end
+
 local function FindActiveQuestEnemy()
     local target = NormalizeQuestMobName(GetActiveQuestMobName())
     if target == "" then
@@ -1974,25 +2019,44 @@ local function GetQuestSpawnCandidates()
 end
 
 local FarmWaypointIndex, FarmWaypointTarget, FarmWaypointUntil = 1, nil, 0
+local FarmWaypointPosition = nil
 local function SelectQuestWaypoint()
     local target = NormalizeQuestMobName(GetActiveQuestMobName())
     if FarmWaypointTarget ~= target then
         FarmWaypointTarget, FarmWaypointIndex, FarmWaypointUntil = target, 1, 0
+        FarmWaypointPosition = nil
     end
     local candidates = GetQuestSpawnCandidates()
-    if #candidates == 0 then return nil, 0 end
-    if tick() >= FarmWaypointUntil then
-        if FarmWaypointUntil ~= 0 then
-            FarmWaypointIndex = FarmWaypointIndex % #candidates + 1
-        end
-        FarmWaypointIndex = math.clamp(FarmWaypointIndex, 1, #candidates)
-        -- Long trips get time to finish; otherwise the next waypoint
-        -- can be selected in mid-flight (back-and-forth movement).
-        local travelDistance = LocalPlayer:DistanceFromCharacter(candidates[FarmWaypointIndex].Position)
-        FarmWaypointUntil = tick() + math.clamp(travelDistance / 240 + 12, 14, 70)
+    if #candidates == 0 then
+        FarmWaypointPosition = nil
+        return nil, 0
     end
-    FarmWaypointIndex = math.clamp(FarmWaypointIndex, 1, #candidates)
-    return candidates[FarmWaypointIndex], #candidates
+    -- A lista e ordenada pela distancia atual do jogador em toda chamada.
+    -- Manter somente indice muda o DESTINO durante a viagem. Fixar a posicao
+    -- evita oscilacao; se a posicao sumir devido ao streaming, recalcular.
+    local retainedIndex = nil
+    if FarmWaypointPosition then
+        for i, candidate in ipairs(candidates) do
+            if (candidate.Position - FarmWaypointPosition).Magnitude < 14 then
+                retainedIndex = i
+                break
+            end
+        end
+    end
+    if tick() < FarmWaypointUntil and retainedIndex then
+        FarmWaypointIndex = retainedIndex
+        return candidates[retainedIndex], #candidates
+    end
+    if retainedIndex and FarmWaypointUntil ~= 0 then
+        FarmWaypointIndex = retainedIndex % #candidates + 1
+    else
+        FarmWaypointIndex = 1 -- mais perto quando nao ha waypoint anterior
+    end
+    local chosen = candidates[FarmWaypointIndex]
+    FarmWaypointPosition = chosen.Position
+    local travelDistance = LocalPlayer:DistanceFromCharacter(chosen.Position)
+    FarmWaypointUntil = tick() + math.clamp(travelDistance / 240 + 12, 14, 70)
+    return chosen, #candidates
 end
 
 local function LoadItem(v, t)
@@ -2992,7 +3056,10 @@ end
 -- para faixas de nivel (Shanda/God's Guard eram incorretos para lv 10-119).
 local function FarmLevelLogic()
     local level = LocalPlayer.Data.Level.Value
-    local questName = tostring(GetActiveQuestMobName() or "")
+    -- O alvo do farm de nivel vem da quest ESPERADA, nao de uma missao
+    -- possivelmente antiga que ainda apareca no painel.
+    local expected = GetQuest()
+    local questName = tostring(expected and expected.NameMonster or "")
     if questName == "" then
         LogChange("farm_no_quest", "farm: unable to select a level quest at lv " .. level)
         SetStatus("farm | quest unavailable | lv " .. level)
@@ -3002,12 +3069,12 @@ local function FarmLevelLogic()
 
     -- On a fresh script start, QuestUpdate may not have been delivered yet.
     -- GuideModule.QuestData serves as a second authoritative client source.
-    if not GetQuestData() then
+    if not LevelQuestMatches() then
         LogChange("farm_quest", "farm: acquiring quest for " .. questName)
         SetStatus("farm | taking quest | lv " .. level)
         TakeQuest()
-        if not GetQuestData() then
-            LogChange("farm_wait_reason", "farm: quest still inactive; " .. QuestStateDiagnostics())
+        if not LevelQuestMatches() then
+            LogChange("farm_wait_reason", "farm: level quest not confirmed; " .. QuestStateDiagnostics())
             SetStatus("farm | waiting for quest | lv " .. level)
             task.wait(0.6)
             return
@@ -3021,31 +3088,62 @@ local function FarmLevelLogic()
         local humanoid = enemy:FindFirstChildOfClass("Humanoid")
         local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
         local deadline = tick() + 55
-        local nextMove, lastDistance, stalledSince = 0, math.huge, tick()
+        local lastDistance, stalledSince = math.huge, tick()
+        local chaseTween, chaseDestination, chaseRetargetAt = nil, nil, 0
+        local lastAttackWarning, nextEquipAt, nextAttackAt = 0, 0, 0
         while enemy.Parent == workspace.Enemies and humanoid and humanoid.Parent and humanoid.Health > 0
             and root and root.Parent and GetQuestData() and tick() < deadline do
             local dist = LocalPlayer:DistanceFromCharacter(root.Position)
             if dist + 12 < lastDistance then stalledSince = tick() end
             lastDistance = dist
-            if dist > 32 then
-                if tick() >= nextMove then
-                    local newTween = Tween(root.Position + Vector3.new(0, 18, 5), 350)
-                    if not newTween then break end
-                    nextMove = tick() + math.clamp(dist / 350, 0.7, 3)
+            if dist > 29 then
+                -- Nao empilhar Tween() / SmartTween() em cada ciclo. Um unico
+                -- deslocamento de perseguicao, atualizado apenas se o alvo
+                -- realmente se mover e respeitando intervalo de 1.2s.
+                local destination = root.Position + Vector3.new(0, 16, 5)
+                local mustRetarget = not chaseTween
+                    or chaseTween.PlaybackState ~= Enum.PlaybackState.Playing
+                    or (chaseDestination and (destination - chaseDestination).Magnitude >= 55
+                        and tick() - chaseRetargetAt >= 1.2)
+                if mustRetarget then
+                    if chaseTween and chaseTween.PlaybackState == Enum.PlaybackState.Playing then
+                        pcall(function() chaseTween:Cancel() end)
+                    end
+                    chaseTween = RunTween(destination, nil, 350)
+                    chaseDestination, chaseRetargetAt = destination, tick()
+                    if not chaseTween then break end
                 end
                 if tick() - stalledSince > 12 then
                     LogChange("farm_movement", "farm: stalled approaching " .. questName .. "; retrying")
-                    StopTween()
+                    if chaseTween then pcall(function() chaseTween:Cancel() end) end
                     break
                 end
             else
+                if chaseTween and chaseTween.PlaybackState == Enum.PlaybackState.Playing then
+                    pcall(function() chaseTween:Cancel() end)
+                end
+                chaseTween = nil
                 stalledSince = tick()
-                -- Can attack only actual mobs in workspace.Enemies.
                 BringMob(enemy.Name)
-                EquipWeapon()
-                Attack()
+                if tick() >= nextEquipAt then
+                    EquipWeapon()
+                    nextEquipAt = tick() + 0.8
+                end
+                -- Evita saturar RegisterAttack/RegisterHit sem reduzir a
+                -- responsividade de movimento (o loop continua a cada 0.18s).
+                if tick() >= nextAttackAt then
+                    nextAttackAt = tick() + 0.32
+                    local attackOk, attackErr = pcall(Attack)
+                    if not attackOk and tick() - lastAttackWarning > 6 then
+                        lastAttackWarning = tick()
+                        warn("[Zyon] farm: attack failed: " .. tostring(attackErr))
+                    end
+                end
             end
             task.wait(0.18)
+        end
+        if chaseTween and chaseTween.PlaybackState == Enum.PlaybackState.Playing then
+            pcall(function() chaseTween:Cancel() end)
         end
         if enemy.Parent and humanoid and humanoid.Health > 0 and tick() >= deadline then
             warn("[Zyon] farm: timed out on " .. questName .. "; reassessing")

@@ -547,12 +547,7 @@ local function BreakClouds()
 	end
 end
 local function SmartTween(t)
-    if World.Sea3() then
-        if not CheckItem("Valkyrie Helm") then
-            LogChange("entrance_block", "travel: missing valkyrie helm")
-            return
-        end
-    end
+    -- Fast-travel entrance selection is independent of Valkyrie Helm ownership.
     if typeof(t) == "CFrame" then
         t = t.Position
     end
@@ -1224,18 +1219,42 @@ end
 local lastTakeQuest = 0
 local QuestController, GetQuest, GetQuestData, GetQuestPosition
 
-GetQuestPosition = function()
+GetQuestPosition = function(questName)
     local nearestPos = nil
     local shortestdist = math.huge
-    for _, v in require(ReplicatedStorage.GuideModule).Data.NPCList do
-        if typeof(v) == "table" and v.Position then
-            for _, x in v do
-                if x == GetQuest()["NameQuest"] then
-                    local distance = LocalPlayer:DistanceFromCharacter(v.Position)
-                    if distance < shortestdist then
-                        shortestdist = distance
-                        nearestPos = v.Position
-                    end
+    local ok, guideData = pcall(function()
+        return require(ReplicatedStorage.GuideModule).Data.NPCList
+    end)
+    if not ok or type(guideData) ~= "table" then
+        return nil
+    end
+
+    questName = questName or (GetQuest() and GetQuest().NameQuest)
+    if not questName then
+        return nil
+    end
+
+    for _, entry in guideData do
+        if typeof(entry) == "table" and entry.Position then
+            local matchesQuest = false
+            for _, value in entry do
+                if value == questName then
+                    matchesQuest = true
+                    break
+                end
+            end
+            if matchesQuest and typeof(entry.Position) == "Vector3" then
+                local distance = LocalPlayer:DistanceFromCharacter(entry.Position)
+                if distance < shortestdist then
+                    shortestdist = distance
+                    nearestPos = entry.Position
+                end
+            elseif matchesQuest and typeof(entry.Position) == "CFrame" then
+                local position = entry.Position.Position
+                local distance = LocalPlayer:DistanceFromCharacter(position)
+                if distance < shortestdist then
+                    shortestdist = distance
+                    nearestPos = position
                 end
             end
         end
@@ -1254,12 +1273,14 @@ local function TakeQuest()
         LogChange("quest_target", "quest: no target")
     end
 	if q and q.NameQuest and q.ID and (not GetQuestData() or QuestController.CurrentQuestName ~= q.NameQuest) then
-		local questPos = GetQuestPosition()
+		local questPos = GetQuestPosition(q.NameQuest)
         LogChange("quest_travel", questPos and "quest: traveling to npc" or "quest: npc position missing")
-		if not questPos then
-			LogChange("quest_travel", "quest: npc position missing, hopping server")
-			Hop()
-		end
+        -- A missing guide position is not a reason to hop servers; hopping can
+        -- interrupt the quest flow and make the character appear elsewhere.
+        if not questPos then
+            lastTakeQuest = tick()
+            return
+        end
 		if questPos and TweenWithRespawnRetry(questPos, 350) then
 			task.wait(0.25)
 			if LocalPlayer:DistanceFromCharacter(questPos) <= 15 then
@@ -2620,9 +2641,11 @@ local function FarmLevelLogic()
 							or v:FindFirstChildOfClass("Humanoid").Health <= 0
 							or v.Name ~= GetMonsterName()
 							or (tick() - startKillThisNPC) >= 90
-						pcall(function()
-							v:Destroy()
-						end)
+						if v:IsDescendantOf(workspace.Enemies) then
+							pcall(function()
+								v:Destroy()
+							end)
+						end
 						if not CheckMonster(GetMonsterName()) then
 							break
 						end
@@ -2636,9 +2659,14 @@ local function FarmLevelLogic()
 			for _, v in {ReplicatedStorage.FortBuilderReplicatedSpawnPositionsFolder, workspace._WorldOrigin.EnemySpawns} do
 				for _, v2 in v:GetChildren() do
 					if not v2.Name:find("Boss") and QuestController.CurrentQuest == v2.Name then
-						repeat task.wait()
+                        local spawnDeadline = tick() + 20
+						repeat
+                            task.wait(0.2)
+                            if not v2.Parent then
+                                break
+                            end
 							Tween(v2:GetPivot().Position + Vector3.new(0, 25, 0), 350)
-						until GetMonsterName()
+						until GetMonsterName() or tick() >= spawnDeadline
 						break
 					end
 				end

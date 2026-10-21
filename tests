@@ -81,70 +81,143 @@ local MaxLevel = (workspace:GetAttribute("LEVEL_CAP") or 2800)
 -- Mantem uma unica sequencia de tentativas, com pcall + intervalo e logs.
 -- Limite: se o processo Roblox for encerrado, um LocalScript nao pode reabri-lo.
 -- Apos o teleport, o executor precisa executar o Kaitun novamente (Auto Execute).
+-- AUTO REJOIN v2: tenta primeiro o botao Reconectar da interface do Roblox.
+-- O TeleportService pode nao funcionar depois da desconexao (erro 277).
+-- Nao ha garantia de que o executor permita cliques sinteticos no CoreGui.
+-- Se o Roblox fechar, sera necessario um recuperador EXTERNO ao processo.
 local AutoRejoinActive = false
-local AutoRejoinReason = nil
 local AutoRejoinLastError = nil
 local AutoRejoinMaxAttempts = math.clamp(tonumber(Config.AutoRejoinMaxAttempts) or 12, 1, 30)
+local AutoRejoinNextCycle = 0
 
-local function StartAutoRejoin(reason)
-    if Config.AutoRejoin == false then return end
-    if AutoRejoinActive then
-        return -- evita multiplos loops competindo entre si
-    end
-    AutoRejoinActive = true
-    AutoRejoinReason = tostring(reason or "unknown")
+local function FindDisconnectPrompt()
+    local ok, prompt = pcall(function()
+        local promptGui = CoreGui:FindFirstChild("RobloxPromptGui")
+        local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
+        return overlay and overlay:FindFirstChild("ErrorPrompt", true)
+    end)
+    if ok then return prompt end
+    return nil
+end
 
-    task.spawn(function()
-        print("[Zyon] rejoin: detected " .. AutoRejoinReason)
-        for attempt = 1, AutoRejoinMaxAttempts do
-            -- Espaco inicial para permitir que a interface de erro estabilize;
-            -- apos isso, evita chamar o servico de teleporte a cada frame.
-            local delaySeconds = (attempt == 1) and 2 or math.min(12 + (attempt - 2) * 8, 60)
-            task.wait(delaySeconds)
-            print(("[Zyon] rejoin: attempt %d/%d (place %s)"):format(
-                attempt, AutoRejoinMaxAttempts, tostring(game.PlaceId)))
-            local ok, err = pcall(function()
-                -- Teleport(placeId, player) funciona a partir do cliente.
-                -- Nao solicita teleporte para game.JobId (servidor que caiu).
-                TeleportService:Teleport(game.PlaceId, LocalPlayer)
-            end)
-            if not ok then
-                AutoRejoinLastError = tostring(err)
-                warn("[Zyon] rejoin: teleport rejected: " .. AutoRejoinLastError)
-            else
-                -- A chamada retornar nao garante que o teleport ocorreu.
-                -- O TeleportInitFailed, abaixo, informa quando ele falhou.
-                print("[Zyon] rejoin: teleport requested; awaiting connection")
+local function FindReconnectButton(prompt)
+    if not prompt then return nil end
+    local accepted = {
+        ["reconectar"] = true,
+        ["reconnect"] = true,
+        ["tentar novamente"] = true,
+        ["try again"] = true,
+        ["retry"] = true,
+    }
+    for _, node in ipairs(prompt:GetDescendants()) do
+        if node:IsA("TextButton") or node:IsA("TextLabel") then
+            local normalized = tostring(node.Text):lower():gsub("^%s+", ""):gsub("%s+$", "")
+            if accepted[normalized] then
+                local candidate = node
+                while candidate and candidate ~= prompt and not candidate:IsA("GuiButton") do
+                    candidate = candidate.Parent
+                end
+                if candidate and candidate:IsA("GuiButton") and candidate.Visible
+                    and candidate.AbsoluteSize.X >= 20 and candidate.AbsoluteSize.Y >= 12 then
+                    return candidate
+                end
             end
         end
-        warn("[Zyon] rejoin: retries exhausted; last error: " ..
-            tostring(AutoRejoinLastError or "not confirmed"))
+    end
+    return nil
+end
+
+local function TryClickReconnect(prompt)
+    local button = FindReconnectButton(prompt)
+    if not button then
+        warn("[Zyon] rejoin: reconnect button not found in ErrorPrompt")
+        return false
+    end
+    local success, err = pcall(function()
+        local pos, size = button.AbsolutePosition, button.AbsoluteSize
+        local x, y = math.floor(pos.X + size.X / 2), math.floor(pos.Y + size.Y / 2)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.15)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    if success then
+        print("[Zyon] rejoin: reconnect button click SENT (not yet confirmed)")
+        return true
+    end
+    warn("[Zyon] rejoin: synthetic reconnect click unavailable: " .. tostring(err))
+    return false
+end
+
+local function TryTeleportRejoin()
+    local success, err = pcall(function()
+        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+    end)
+    if success then
+        print("[Zyon] rejoin: teleport requested (not yet confirmed)")
+    else
+        AutoRejoinLastError = tostring(err)
+        warn("[Zyon] rejoin: teleport rejected: " .. AutoRejoinLastError)
+    end
+end
+
+local function StartAutoRejoin(reason)
+    if Config.AutoRejoin == false or AutoRejoinActive then return end
+    if os.clock() < AutoRejoinNextCycle then return end
+    AutoRejoinActive = true
+    task.spawn(function()
+        local seenPrompt = FindDisconnectPrompt() ~= nil
+        local ok, err = pcall(function()
+            print("[Zyon] rejoin: detected " .. tostring(reason or "unknown"))
+            for attempt = 1, AutoRejoinMaxAttempts do
+                task.wait(attempt == 1 and 2 or math.min(12 + (attempt - 2) * 3, 30))
+                local prompt = FindDisconnectPrompt()
+                if prompt then seenPrompt = true end
+                if seenPrompt and not prompt then
+                    print("[Zyon] rejoin: disconnect prompt disappeared; check if game restarted")
+                    break
+                end
+                print(("[Zyon] rejoin: attempt %d/%d, error prompt: %s"):format(
+                    attempt, AutoRejoinMaxAttempts, tostring(prompt ~= nil)))
+                local clicked = false
+                if prompt then
+                    clicked = TryClickReconnect(prompt)
+                end
+                -- Alterna estrategias: se o clique nao funcionar, nao fica
+                -- tentando so a interface para sempre.
+                if (not clicked) or attempt % 3 == 0 then
+                    TryTeleportRejoin()
+                end
+            end
+        end)
+        if not ok then
+            warn("[Zyon] rejoin: watcher failed: " .. tostring(err))
+        end
         AutoRejoinActive = false
+        -- Se o prompt persistir, o monitor inicia outro ciclo depois da pausa.
+        AutoRejoinNextCycle = os.clock() + 60
+        if FindDisconnectPrompt() then
+            warn("[Zyon] rejoin: still disconnected after attempts; retry cycle in 60s")
+        end
     end)
 end
 
--- Prompt aparece assincronamente e pode ser criado antes de MessageArea.
--- Esperamos a GUI sem bloquear o carregamento do Kaitun.
+-- Monitorar, inclusive se ErrorPrompt ja existia antes da conexao do evento.
+-- A varredura ajuda quando a interface e criada de forma assincrona.
 task.spawn(function()
-    local promptGui = CoreGui:WaitForChild("RobloxPromptGui", 25)
-    local overlay = promptGui and promptGui:WaitForChild("promptOverlay", 25)
-    if not overlay then
-        warn("[Zyon] rejoin: RobloxPromptGui not found; using other signals")
-        return
-    end
-    local function CheckErrorPrompt(child)
-        if child and child.Name == "ErrorPrompt" then
+    local guiReadyLogged = false
+    while true do
+        task.wait(3)
+        local gui = CoreGui:FindFirstChild("RobloxPromptGui")
+        if gui and not guiReadyLogged then
+            guiReadyLogged = true
+            print("[Zyon] rejoin: prompt monitor ready")
+        end
+        if FindDisconnectPrompt() then
             StartAutoRejoin("Roblox ErrorPrompt")
         end
     end
-    overlay.ChildAdded:Connect(CheckErrorPrompt)
-    for _, child in ipairs(overlay:GetChildren()) do
-        CheckErrorPrompt(child)
-    end
 end)
 
--- Disparador complementar: nao trate a remocao de QUALQUER filho de
--- NetworkClient como queda. Somente desconexao do replicador do cliente.
 pcall(function()
     local network = game:GetService("NetworkClient")
     network.ChildRemoved:Connect(function(child)
@@ -154,8 +227,6 @@ pcall(function()
     end)
 end)
 
--- Falha de teleport (inclusive servidor lotado): nao chama o RemoteFunction
--- do mundo, pois ele pode nao responder quando o cliente esta offline.
 TeleportService.TeleportInitFailed:Connect(function(player, result, err)
     if player ~= LocalPlayer then return end
     AutoRejoinLastError = tostring(result) .. ": " .. tostring(err)

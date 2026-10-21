@@ -1217,7 +1217,7 @@ local function KillMonster(_v)
 end
 
 local lastTakeQuest = 0
-local QuestController, GetQuest, GetQuestData, GetQuestPosition
+local QuestController, GetQuest, GetQuestData, GetQuestPosition, QuestStateDiagnostics
 
 GetQuestPosition = function(questName)
     questName = tostring(questName or "")
@@ -1284,24 +1284,54 @@ local function TakeQuest()
             return
         end
         SetStatus("quest | going to npc: " .. tostring(q.NameQuest))
-		if TweenWithRespawnRetry(questPos, 350) then
-			task.wait(0.25)
-			if LocalPlayer:DistanceFromCharacter(questPos) <= 15 then
-                LogChange("quest_start", "quest: starting " .. string.lower(tostring(q.NameQuest)))
-                SetStatus("quest | starting " .. string.lower(tostring(q.NameQuest)))
-                local ok, result = pcall(function()
-                    return CommF_:InvokeServer("StartQuest", q.NameQuest, q.ID)
-                end)
-                if not ok then
-                    warn("[Zyon] Quest StartQuest failed: " .. tostring(result))
-                else
-                    task.wait(0.35)
-                    if not GetQuestData() then
-                        warn("[Zyon] Quest did not become active: " .. tostring(q.NameQuest))
-                    end
+        local traveled = TweenWithRespawnRetry(questPos, 350)
+        task.wait(0.2)
+        if GetQuestData() then
+            lastTakeQuest = tick()
+            return
+        end
+        local distance = LocalPlayer:DistanceFromCharacter(questPos)
+        -- Um Tween 'Completed' pode terminar ainda fora do raio de inicio.
+        -- Fazer a aproximacao final, sem repetir a viagem inteira ate o NPC.
+        if distance > 10 and distance <= 42 then
+            local closeTween = RunTween(questPos, nil, 220)
+            if closeTween then
+                local closeDeadline = tick() + math.clamp(distance / 220 + 2, 2, 5)
+                while tick() < closeDeadline and LocalPlayer:DistanceFromCharacter(questPos) > 10 do
+                    task.wait(0.1)
                 end
-			end
-		end
+                if LocalPlayer:DistanceFromCharacter(questPos) > 10 then
+                    pcall(function() closeTween:Cancel() end)
+                end
+            end
+            distance = LocalPlayer:DistanceFromCharacter(questPos)
+        end
+        if not traveled and distance > 20 then
+            -- Antes o retorno falso era silencioso e produzia tentativas
+            -- de 30 em 30 segundos sem informar a causa.
+            warn(string.format("[Zyon] quest: travel failed; npc=%s distance=%.1f; %s",
+                tostring(q.NameQuest), distance, QuestStateDiagnostics()))
+        elseif distance > 20 then
+            warn(string.format("[Zyon] quest: still too far from npc; npc=%s distance=%.1f",
+                tostring(q.NameQuest), distance))
+        else
+            -- Mesmo com Completed=Cancelled, podemos ja estar perto do NPC.
+            -- A autorizacao da missao continua sendo feita pelo servidor.
+            LogChange("quest_start", "quest: starting " .. string.lower(tostring(q.NameQuest)))
+            SetStatus("quest | starting " .. string.lower(tostring(q.NameQuest)))
+            local ok, result = pcall(function()
+                return CommF_:InvokeServer("StartQuest", q.NameQuest, q.ID)
+            end)
+            if not ok then
+                warn("[Zyon] Quest StartQuest failed: " .. tostring(result))
+            else
+                task.wait(0.65)
+                if not GetQuestData() then
+                    warn(string.format("[Zyon] quest: StartQuest unconfirmed; npc=%s id=%s distance=%.1f result=%s; %s",
+                        tostring(q.NameQuest), tostring(q.ID), distance, tostring(result), QuestStateDiagnostics()))
+                end
+            end
+        end
 	end
 	lastTakeQuest = tick()
 end
@@ -1373,17 +1403,36 @@ end
 local function IsQuestPanelVisible()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     local mainGui = playerGui and playerGui:FindFirstChild("Main")
-    local questGui = mainGui and mainGui:FindFirstChild("Quest")
-    return questGui and questGui:IsA("GuiObject") and questGui.Visible == true
+    -- Em diferentes versoes Main.Quest pode ser GuiObject ou ScreenGui.
+    -- Quando a estrutura nao e diretamente visivel, procurar o painel
+    -- 'Quest' dentro de Main antes de considerar a missao inativa.
+    local questGui = mainGui and mainGui:FindFirstChild("Quest", true)
+    if questGui then
+        if questGui:IsA("GuiObject") then
+            return questGui.Visible == true
+        elseif questGui:IsA("ScreenGui") then
+            return questGui.Enabled == true
+        end
+    end
+    return false
 end
 
 GetQuestData = function()
     if QuestController.CurrentQuest ~= "" then
         return true
     end
-    -- GuideModule can retain LAST quest after completion. Trust that data
-    -- only if the mission UI is actually visible to the player.
+    -- QuestData pode conservar a ultima missao concluida. O fallback
+    -- exige painel visivel para evitar falso positivo.
     return IsQuestPanelVisible() and ReadGuideQuest() ~= nil or false
+end
+
+QuestStateDiagnostics = function()
+    local activeName = tostring(QuestController.CurrentQuest or "")
+    local panelVisible = IsQuestPanelVisible()
+    local guideName = ReadGuideQuest()
+    return string.format("event=%s; panel=%s; guide=%s",
+        activeName ~= "" and activeName or "empty",
+        tostring(panelVisible), tostring(guideName or "empty"))
 end
 
 local function GetLastQuest()
@@ -2708,6 +2757,7 @@ local function FarmLevelLogic()
         SetStatus("farm | taking quest | lv " .. level)
         TakeQuest()
         if not GetQuestData() then
+            LogChange("farm_wait_reason", "farm: quest still inactive; " .. QuestStateDiagnostics())
             SetStatus("farm | waiting for quest | lv " .. level)
             task.wait(0.6)
             return
@@ -3578,18 +3628,31 @@ end
 
 local RaidController = {
 	isRaiding = false,
+    startedAt = 0,
 }
 RaidController.RaidState_Connection = nil
 if World.Sea2() or World.Sea3() then
 	if ReplicatedStorage.Remotes:FindFirstChild("Raids") then
 		while not RaidController.RaidState_Connection do
-			RaidController.RaidState_Connection = ReplicatedStorage.Remotes.Raids.OnClientEvent:Connect(function(a)
-				if a == "StartTimer" then
-					RaidController.isRaiding = true
-				else
-					RaidController.isRaiding = false
-				end
-			end)
+            RaidController.RaidState_Connection = ReplicatedStorage.Remotes.Raids.OnClientEvent:Connect(function(a)
+                -- Eventos de ondas, ilhas e interface NAO significam fim da raid.
+                -- Antes QUALQUER evento diferente de StartTimer encerrava o
+                -- AutoDungeon, mandando o personagem voltar para o farm.
+                if a == "StartTimer" then
+                    RaidController.isRaiding = true
+                    RaidController.startedAt = tick()
+                    LogChange("raid_signal", "raid: StartTimer received; raid active")
+                elseif type(a) == "string" and table.find({
+                    "StopTimer", "EndTimer", "TimerEnded", "RaidEnded", "RaidEnd",
+                    "EndRaid", "FinishRaid", "RaidFinished", "Victory", "Failed",
+                }, a) then
+                    RaidController.isRaiding = false
+                    RaidController.startedAt = 0
+                    LogChange("raid_signal", "raid: explicit end signal " .. a)
+                elseif type(a) == "string" then
+                    LogChange("raid_other_signal", "raid: ignoring non-terminal event " .. a)
+                end
+            end)
 			task.wait(0.5)
 		end
 	end
@@ -3705,6 +3768,13 @@ AutoDungeon = function()
         local raidIslandIndex = 1
         local lastEnemySeen = tick()
         while RaidController.isRaiding do
+            -- Failsafe apenas se o servidor nao emitir nenhum sinal terminal.
+            -- Raids normais tem duracao menor; nunca abandonar por onda/ilha.
+            if RaidController.startedAt > 0 and tick() - RaidController.startedAt > 16 * 60 then
+                warn("[Zyon] raid: safety timeout (16min) without explicit end; rechecking progression")
+                RaidController.isRaiding = false
+                break
+            end
             -- Segue Ilha 1 -> 5 em ordem, sem saltar direto para a ultima ilha
             -- simplesmente porque ela ja apareceu no mapa.
             local worldOrigin = workspace:FindFirstChild("_WorldOrigin")
@@ -4017,6 +4087,13 @@ task.spawn(function()
     print("main loop started")
 	while task.wait(0.15) do
         local mainOk, mainErr = pcall(function()
+            -- Raid ja iniciada tem prioridade absoluta sobre estilos, Yama,
+            -- quests e farm. Cada cliente gerencia apenas a sua propria conta.
+            if RaidController.isRaiding then
+                LogChange("main_mode", "mode: active raid")
+                AutoDungeon()
+                return
+            end
             if MeleeKaitunLogic() then
                 return
             end

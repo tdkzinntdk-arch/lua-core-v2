@@ -1,7 +1,7 @@
 -- Reliability patch applied 2026-10-20.
 -- Scope: bounded waits, Tween speed forwarding, forced-kick removal, and removal
 -- of __namecall interception that suppressed integrity-related remote calls.
--- Factory/Pirate Raid branches remain unchanged and disabled pending verified mechanics.
+-- Factory (Sea2) e Pirate Castle (Sea3) agora funcionam como eventos de prioridade 2.
 getgenv().Configs = {
 	Team = "Pirates",
 	FixLag = false,
@@ -13,7 +13,15 @@ getgenv().Configs = {
 	SkullGuitar = true,
 	RaceV3 = true,
 	AutoRejoin = true,
-	AutoRejoinMaxAttempts = 12
+	AutoRejoinMaxAttempts = 12,
+	AutoFruitPickup = true,          -- coleta frutas que nasceram ou foram largadas
+	AutoFruitSpin = true,            -- compra aleatoria no Zioles (Cousin/Buy)
+	AutoFruitStore = true,           -- guarda frutas fisicas sem comer
+	FruitSpinInterval = 7200,       -- cooldown base: 2 horas
+	FruitSpinReserveBeli = 250000,  -- preserva algum Beli para farm
+	AutoEventRaids = true,          -- Factory (Sea2) e Pirate Castle (Sea3)
+	AutoNormalRaids = false,        -- raids de microchip nao sao raid events
+	EnableSideProgression = false   -- prioridades EXATAS: fruta > evento > nivel
 }
 
 -- ===== CORRIGIDO (Zyon) =====
@@ -35,7 +43,15 @@ do
 		SkullGuitar = true,
 		RaceV3 = true,
 		AutoRejoin = true,
-		AutoRejoinMaxAttempts = 12
+		AutoRejoinMaxAttempts = 12,
+	AutoFruitPickup = true,          -- coleta frutas que nasceram ou foram largadas
+	AutoFruitSpin = true,            -- compra aleatoria no Zioles (Cousin/Buy)
+	AutoFruitStore = true,           -- guarda frutas fisicas sem comer
+	FruitSpinInterval = 7200,       -- cooldown base: 2 horas
+	FruitSpinReserveBeli = 250000,  -- preserva algum Beli para farm
+	AutoEventRaids = true,          -- Factory (Sea2) e Pirate Castle (Sea3)
+	AutoNormalRaids = false,        -- raids de microchip nao sao raid events
+	EnableSideProgression = false   -- prioridades EXATAS: fruta > evento > nivel
 	}
 
 	getgenv().Configs = getgenv().Configs or {}
@@ -76,50 +92,73 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local CommF_ = ReplicatedStorage.Remotes.CommF_
 local CommE = ReplicatedStorage.Remotes.CommE
 local MaxLevel = (workspace:GetAttribute("LEVEL_CAP") or 2800)
--- AUTO REJOIN (Zyon): reentrada nao depende de __ServerBrowser:InvokeServer,
--- que pode falhar justamente quando a conexao com o servidor foi perdida.
--- Mantem uma unica sequencia de tentativas, com pcall + intervalo e logs.
--- Limite: se o processo Roblox for encerrado, um LocalScript nao pode reabri-lo.
--- Apos o teleport, o executor precisa executar o Kaitun novamente (Auto Execute).
--- AUTO REJOIN v2: tenta primeiro o botao Reconectar da interface do Roblox.
--- O TeleportService pode nao funcionar depois da desconexao (erro 277).
--- Nao ha garantia de que o executor permita cliques sinteticos no CoreGui.
--- Se o Roblox fechar, sera necessario um recuperador EXTERNO ao processo.
+-- AUTO REJOIN v3 (Zyon): protecao para desconexao real (277/773).
+-- Depois da remocao do ClientReplicator, TeleportService:Teleport pode falhar
+-- com Unauthorized / invalid teleport token. Nao usamos teleport nessa condicao.
+-- O botao nativo Reconectar e acionado com intervalo e o resultado e observado.
+-- Enviar um clique nao prova que a sessao voltou: exigimos novo ClientReplicator.
+-- Um script dentro do Roblox nao consegue reabrir o aplicativo caso ele feche.
 local AutoRejoinActive = false
-local AutoRejoinLastError = nil
-local AutoRejoinMaxAttempts = math.clamp(tonumber(Config.AutoRejoinMaxAttempts) or 12, 1, 30)
 local AutoRejoinNextCycle = 0
+local AutoRejoinMaxAttempts = math.clamp(tonumber(Config.AutoRejoinMaxAttempts) or 12, 1, 30)
 
 local function FindDisconnectPrompt()
     local ok, prompt = pcall(function()
-        local promptGui = CoreGui:FindFirstChild("RobloxPromptGui")
-        local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
-        return overlay and overlay:FindFirstChild("ErrorPrompt", true)
+        local gui = CoreGui:FindFirstChild("RobloxPromptGui")
+        local overlay = gui and gui:FindFirstChild("promptOverlay")
+        local obj = overlay and overlay:FindFirstChild("ErrorPrompt", true)
+        if obj and obj:IsA("GuiObject") and obj.Visible then
+            return obj
+        end
+        return nil
     end)
-    if ok then return prompt end
-    return nil
+    return ok and prompt or nil
+end
+
+local function HasClientReplicator()
+    local ok, found = pcall(function()
+        local network = game:GetService("NetworkClient")
+        for _, obj in ipairs(network:GetChildren()) do
+            if obj.ClassName == "ClientReplicator" then return true end
+        end
+        return false
+    end)
+    return ok and found or false
+end
+
+local function GetPromptErrorCode(prompt)
+    if not prompt then return "none" end
+    for _, obj in ipairs(prompt:GetDescendants()) do
+        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+            local label = tostring(obj.Text):lower()
+            local code = label:match("%f[%d](277)%f[%D]")
+                or label:match("%f[%d](773)%f[%D]")
+                or label:match("error%s*code%s*:?%s*(%d+)")
+                or label:match("erro%s*:?%s*(%d+)")
+            if code then return code end
+        end
+    end
+    return "unknown"
 end
 
 local function FindReconnectButton(prompt)
     if not prompt then return nil end
     local accepted = {
-        ["reconectar"] = true,
-        ["reconnect"] = true,
-        ["tentar novamente"] = true,
-        ["try again"] = true,
+        ["reconectar"] = true, ["reconnect"] = true,
+        ["tentar novamente"] = true, ["try again"] = true,
         ["retry"] = true,
     }
     for _, node in ipairs(prompt:GetDescendants()) do
         if node:IsA("TextButton") or node:IsA("TextLabel") then
-            local normalized = tostring(node.Text):lower():gsub("^%s+", ""):gsub("%s+$", "")
-            if accepted[normalized] then
-                local candidate = node
-                while candidate and candidate ~= prompt and not candidate:IsA("GuiButton") do
-                    candidate = candidate.Parent
+            local name = tostring(node.Text):lower():gsub("^%s+", ""):gsub("%s+$", "")
+            if accepted[name] then
+                local button = node
+                while button and button ~= prompt and not button:IsA("GuiButton") do
+                    button = button.Parent
                 end
-                if candidate and candidate:IsA("GuiButton") and candidate.Visible
-                    and candidate.AbsoluteSize.X >= 20 and candidate.AbsoluteSize.Y >= 12 then
-                    return candidate
+                if button and button:IsA("GuiButton") and button.Visible
+                    and button.AbsoluteSize.X >= 20 and button.AbsoluteSize.Y >= 12 then
+                    return button
                 end
             end
         end
@@ -130,34 +169,27 @@ end
 local function TryClickReconnect(prompt)
     local button = FindReconnectButton(prompt)
     if not button then
-        warn("[Zyon] rejoin: reconnect button not found in ErrorPrompt")
+        warn("[Zyon] rejoin: button Reconectar not found (UI may have changed)")
         return false
     end
-    local success, err = pcall(function()
+    local ok, err = pcall(function()
         local pos, size = button.AbsolutePosition, button.AbsoluteSize
-        local x, y = math.floor(pos.X + size.X / 2), math.floor(pos.Y + size.Y / 2)
+        local x = math.floor(pos.X + size.X / 2)
+        local y = math.floor(pos.Y + size.Y / 2)
         VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
-        task.wait(0.15)
+        task.wait(0.12)
         VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
     end)
-    if success then
-        print("[Zyon] rejoin: reconnect button click SENT (not yet confirmed)")
-        return true
+    if not ok then
+        warn("[Zyon] rejoin: click could not be sent: " .. tostring(err))
+        return false
     end
-    warn("[Zyon] rejoin: synthetic reconnect click unavailable: " .. tostring(err))
-    return false
+    print("[Zyon] rejoin: native Reconectar click SENT; awaiting outcome")
+    return true
 end
 
-local function TryTeleportRejoin()
-    local success, err = pcall(function()
-        TeleportService:Teleport(game.PlaceId, LocalPlayer)
-    end)
-    if success then
-        print("[Zyon] rejoin: teleport requested (not yet confirmed)")
-    else
-        AutoRejoinLastError = tostring(err)
-        warn("[Zyon] rejoin: teleport rejected: " .. AutoRejoinLastError)
-    end
+local function IsReconnected()
+    return FindDisconnectPrompt() == nil and HasClientReplicator()
 end
 
 local function StartAutoRejoin(reason)
@@ -165,51 +197,80 @@ local function StartAutoRejoin(reason)
     if os.clock() < AutoRejoinNextCycle then return end
     AutoRejoinActive = true
     task.spawn(function()
-        local seenPrompt = FindDisconnectPrompt() ~= nil
         local ok, err = pcall(function()
-            print("[Zyon] rejoin: detected " .. tostring(reason or "unknown"))
+            print("[Zyon] rejoin: signal: " .. tostring(reason or "unknown"))
+            -- A tela pode demorar para surgir apos perder ClientReplicator.
+            local prompt
+            for _ = 1, 15 do
+                prompt = FindDisconnectPrompt()
+                if prompt or IsReconnected() then break end
+                task.wait(1)
+            end
+            if IsReconnected() then
+                print("[Zyon] rejoin: connection still active / recovered")
+                return
+            end
+            if not prompt then
+                warn("[Zyon] rejoin: disconnected but ErrorPrompt unavailable; client-side recovery cannot be guaranteed")
+                return
+            end
+
             for attempt = 1, AutoRejoinMaxAttempts do
-                task.wait(attempt == 1 and 2 or math.min(12 + (attempt - 2) * 3, 30))
-                local prompt = FindDisconnectPrompt()
-                if prompt then seenPrompt = true end
-                if seenPrompt and not prompt then
-                    print("[Zyon] rejoin: disconnect prompt disappeared; check if game restarted")
+                if IsReconnected() then
+                    print("[Zyon] rejoin: CONFIRMED (ClientReplicator restored, no error prompt)")
+                    return
+                end
+                prompt = FindDisconnectPrompt()
+                if not prompt then
+                    -- A interface pode desaparecer durante a reconexao.
+                    task.wait(8)
+                    if IsReconnected() then
+                        print("[Zyon] rejoin: CONFIRMED (ClientReplicator restored)")
+                        return
+                    end
+                    warn("[Zyon] rejoin: prompt disappeared but connection not confirmed")
                     break
                 end
-                print(("[Zyon] rejoin: attempt %d/%d, error prompt: %s"):format(
-                    attempt, AutoRejoinMaxAttempts, tostring(prompt ~= nil)))
-                local clicked = false
-                if prompt then
-                    clicked = TryClickReconnect(prompt)
+                local codeBefore = GetPromptErrorCode(prompt)
+                print(("[Zyon] rejoin: attempt %d/%d, prompt error: %s"):format(
+                    attempt, AutoRejoinMaxAttempts, codeBefore))
+                TryClickReconnect(prompt)
+                -- Deixe o cliente concluir a tentativa; cliques rapidos podem
+                -- interromper a tela de reconexao ainda em andamento.
+                for _ = 1, 15 do
+                    task.wait(1)
+                    if IsReconnected() then
+                        print("[Zyon] rejoin: CONFIRMED (ClientReplicator restored)")
+                        return
+                    end
                 end
-                -- Alterna estrategias: se o clique nao funcionar, nao fica
-                -- tentando so a interface para sempre.
-                if (not clicked) or attempt % 3 == 0 then
-                    TryTeleportRejoin()
+                local currentPrompt = FindDisconnectPrompt()
+                if currentPrompt then
+                    warn("[Zyon] rejoin: still disconnected; prompt error: " .. GetPromptErrorCode(currentPrompt))
+                else
+                    warn("[Zyon] rejoin: no prompt, but ClientReplicator absent")
                 end
+                task.wait(math.min(5 + attempt * 2, 25))
             end
+            warn("[Zyon] rejoin: attempts exhausted. Teleport disabled after disconnection (invalid token).")
+            warn("[Zyon] rejoin: if native reconnect also fails, use external Roblox process recovery.")
         end)
         if not ok then
-            warn("[Zyon] rejoin: watcher failed: " .. tostring(err))
+            warn("[Zyon] rejoin: monitor failed: " .. tostring(err))
         end
         AutoRejoinActive = false
-        -- Se o prompt persistir, o monitor inicia outro ciclo depois da pausa.
-        AutoRejoinNextCycle = os.clock() + 60
-        if FindDisconnectPrompt() then
-            warn("[Zyon] rejoin: still disconnected after attempts; retry cycle in 60s")
-        end
+        AutoRejoinNextCycle = os.clock() + 90
     end)
 end
 
--- Monitorar, inclusive se ErrorPrompt ja existia antes da conexao do evento.
--- A varredura ajuda quando a interface e criada de forma assincrona.
+-- Uma unica rotina observa a tela, mesmo se o evento da queda foi perdido.
 task.spawn(function()
-    local guiReadyLogged = false
+    local guiLogged = false
     while true do
         task.wait(3)
         local gui = CoreGui:FindFirstChild("RobloxPromptGui")
-        if gui and not guiReadyLogged then
-            guiReadyLogged = true
+        if gui and not guiLogged then
+            guiLogged = true
             print("[Zyon] rejoin: prompt monitor ready")
         end
         if FindDisconnectPrompt() then
@@ -219,8 +280,7 @@ task.spawn(function()
 end)
 
 pcall(function()
-    local network = game:GetService("NetworkClient")
-    network.ChildRemoved:Connect(function(child)
+    game:GetService("NetworkClient").ChildRemoved:Connect(function(child)
         if child and child.ClassName == "ClientReplicator" then
             StartAutoRejoin("ClientReplicator removed")
         end
@@ -229,9 +289,12 @@ end)
 
 TeleportService.TeleportInitFailed:Connect(function(player, result, err)
     if player ~= LocalPlayer then return end
-    AutoRejoinLastError = tostring(result) .. ": " .. tostring(err)
-    warn("[Zyon] rejoin: TeleportInitFailed: " .. AutoRejoinLastError)
-    StartAutoRejoin("TeleportInitFailed")
+    warn("[Zyon] rejoin: TeleportInitFailed: " .. tostring(result) .. ": " .. tostring(err))
+    -- Nao tente outro TeleportService:Teleport depois de perder a sessao.
+    -- O servidor precisa emitir um token valido; o cliente desconectado nao tem.
+    if FindDisconnectPrompt() then
+        StartAutoRejoin("TeleportInitFailed with disconnect prompt")
+    end
 end)
 
 if Config.WhiteScreen then
@@ -394,18 +457,9 @@ LocalPlayer.CharacterAdded:Connect(function(v)
 	print("character respawned")
 end)
 
-pcall(function()
-	LocalPlayer.PlayerGui.ChildAdded:Connect(function(child)
-		if child.Name == "SpinnerWindow" then
-			child:Destroy()
-		end
-	end)
-	workspace.ChildAdded:Connect(function(df)
-		if df:IsA('Tool') then
-			df:Destroy()
-		end
-	end)
-end)
+-- PRIORIDADES v1: nao apagar Tools adicionadas ao workspace!
+-- O codigo antigo destruia todas, inclusive frutas dropadas ou spawnadas.
+-- SpinnerWindow tambem e a UI legitima do giro aleatorio; nao destruir.
 
 task.spawn(function()
 	while true do
@@ -2280,10 +2334,10 @@ task.spawn(function()
 	-- lado do servidor. Por isso a correcao e conservadora: mantem a chamada
 	-- (para nao quebrar o que ela ja fazia) mas a coloca dentro do bloco
 	-- pausavel e reduz a cadencia de 1s para 3s.
-	local ciclo = 0
-
+    -- A consulta antiga a Cousin/DLCBoxData NAO gira frutas. O giro real
+    -- agora e feito exclusivamente pelo gerenciador com Cousin/Buy.
 	while true do
-		if not PAUSE_AUTO_STORE then
+		if Config.AutoFruitStore ~= false and not PAUSE_AUTO_STORE then
 			pcall(function()
 				local gg = {}
 				for _, _v in { LocalPlayer.Backpack, LocalPlayer.Character } do
@@ -2319,16 +2373,11 @@ task.spawn(function()
 					end
 				end
 
-				-- verificacao DLC (antes rodava sempre, agora so quando ativo)
-				ciclo = ciclo + 1
-
-				if ciclo % 3 == 0 then
-					CommF_:InvokeServer("Cousin", "DLCBoxData")
-				end
+                -- Nao consultar o NPC de gacha em paralelo com a compra.
 			end)
 		end
 
-		task.wait(1)
+		task.wait(3) -- verifica o inventario sem floodar remotes
 	end
 end)
 
@@ -4508,35 +4557,36 @@ task.spawn(function()
 				CommF_:InvokeServer("AddPoint","Sword",LocalPlayer.Data.Level.Value * 3 - MaxLevel * 2)
 			end
 		end
+		task.wait(0.5)
 	end
 end)
 
 CAN_SPAWN_CAKE_PRINCE = true
 task.spawn(function()
-	while World.Sea3() do
-		if CAN_SPAWN_CAKE_PRINCE then
-			CommF_:InvokeServer("CakePrinceSpawner")
-		end
-		if GetMaterial("Bones") >= 50 then
-			CommF_:InvokeServer("Bones", "Buy", 1, 1)
-		end
-		task.wait(0.5)
-	end
+    while World.Sea3() do
+        -- Rotinas paralelas de progressao nao podem disputar remotes
+        -- enquanto a prioridade explicita e fruta/evento/level.
+        if Config.EnableSideProgression then
+            pcall(function()
+                if CAN_SPAWN_CAKE_PRINCE then CommF_:InvokeServer("CakePrinceSpawner") end
+                if GetMaterial("Bones") >= 50 then CommF_:InvokeServer("Bones", "Buy", 1, 1) end
+            end)
+        end
+        task.wait(15)
+    end
 end)
 
 print("initialized")
-task.spawn(function()
-    print("main loop started")
-	while task.wait(0.15) do
+local function RunLegacyProgressionStep()
         local mainOk, mainErr = pcall(function()
             -- Raid ja iniciada tem prioridade absoluta sobre estilos, Yama,
             -- quests e farm. Cada cliente gerencia apenas a sua propria conta.
-            if RaidController.isRaiding then
-                LogChange("main_mode", "mode: active raid")
+            if Config.AutoNormalRaids and RaidController.isRaiding then
+                LogChange("main_mode", "mode: active normal raid")
                 AutoDungeon()
                 return
             end
-            if MeleeKaitunLogic() then
+            if Config.AutoNormalRaids and MeleeKaitunLogic() then
                 return
             end
 		if Config.CursedDualKatana and (function() local b = 0 for i in {"Tushita", "Yama"} do if CheckItem(i) then
@@ -4725,5 +4775,438 @@ task.spawn(function()
             warn("[Zyon] main loop: " .. tostring(mainErr))
             task.wait(1)
         end
-	end
+end
+
+
+-- ============================================================================
+-- PRIORIDADES (Zyon): 1) FRUTAS  2) EVENTOS  3) LEVEL.
+-- Somente UM worker pode movimentar/atacar/comprar a cada instante.
+-- Um spawn de fruta cancela a rotina de nivel/evento e o tween em curso.
+-- A raid de microchip continua no arquivo, mas NAO inicia por padrao:
+-- Factory Raid e Pirate Raid do Castelo sao EVENTOS, nao raid de microchip.
+-- ============================================================================
+local PriorityWorker, PriorityMode, PriorityTarget = nil, nil, nil
+local PriorityWorkerStarted = 0
+local FruitRetryAfter = setmetatable({}, {__mode="k"})
+local FruitSpinNext = tick() + 15
+local LastFruitScan = 0
+local CachedFruit = nil
+
+local function IsWorldFruit(object)
+    if not object or not object.Parent or not object:IsDescendantOf(workspace) then return false end
+    if not (object:IsA("Tool") or object:IsA("Model")) then return false end
+    local name = object.Name:lower()
+    local isFruit = name:find("fruit", 1, true) ~= nil
+    if object:IsA("Tool") then
+        isFruit = isFruit or tostring(object.ToolTip):lower() == "blox fruit"
+    end
+    if not isFruit then return false end
+    local root = object:FindFirstChild("Handle") or object:FindFirstChildWhichIsA("BasePart", true)
+    if not root then return false end
+    local ancestor = object.Parent
+    while ancestor and ancestor ~= workspace do
+        if ancestor == workspace.Enemies or ancestor == workspace.Map
+            or ancestor == LocalPlayer.Character or ancestor:IsA("Tool") then
+            return false
+        end
+        if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
+            return false -- nao roubar item equipado de outro jogador
+        end
+        ancestor = ancestor.Parent
+    end
+    return true
+end
+
+local function FruitPosition(item)
+    if not IsWorldFruit(item) then return nil end
+    local part = item:FindFirstChild("Handle") or item:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position, part
+end
+
+local function FindGroundFruit()
+    if Config.AutoFruitPickup == false then return nil end
+    if CachedFruit and IsWorldFruit(CachedFruit) and tick() >= (FruitRetryAfter[CachedFruit] or 0) then
+        return CachedFruit
+    end
+    if tick() - LastFruitScan < 0.35 then return nil end
+    LastFruitScan = tick()
+    local nearest, nearestDist = nil, math.huge
+    -- Frutas nascem como ferramentas no Workspace; pastas de drops tambem sao aceitas.
+    local function consider(object)
+        if IsWorldFruit(object) and tick() >= (FruitRetryAfter[object] or 0) then
+            local pos = FruitPosition(object)
+            if pos then
+                local d = LocalPlayer:DistanceFromCharacter(pos)
+                if d < nearestDist then nearest, nearestDist = object, d end
+            end
+        end
+    end
+    for _, obj in ipairs(workspace:GetChildren()) do
+        consider(obj)
+        if obj:IsA("Folder") and (obj.Name:lower():find("drop") or obj.Name:lower():find("fruit")) then
+            for _, child in ipairs(obj:GetDescendants()) do consider(child) end
+        end
+    end
+    CachedFruit = nearest
+    return nearest
+end
+
+-- Aviso rapido sobre frutas que aparecem a meio caminho de outro farm.
+workspace.DescendantAdded:Connect(function(obj)
+    if (obj:IsA("Tool") or obj:IsA("Model")) and obj.Name:lower():find("fruit", 1, true) then
+        task.defer(function()
+            if IsWorldFruit(obj) then
+                CachedFruit = obj
+                LastFruitScan = 0
+                LogChange("fruit_detected", "fruit: appeared on map: " .. obj.Name)
+            end
+        end)
+    end
+end)
+workspace.DescendantRemoving:Connect(function(obj)
+    if obj == CachedFruit then CachedFruit = nil; LastFruitScan = 0 end
+end)
+-- Cobre frutas que ja estavam no mapa antes da inicializacao do script.
+-- Feito apenas uma vez; depois DescendantAdded monitora novos drops.
+task.defer(function()
+    if Config.AutoFruitPickup ~= false then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if IsWorldFruit(obj) then
+                CachedFruit = obj
+                LastFruitScan = 0
+                break
+            end
+        end
+    end
+end)
+
+local function CollectGroundFruit(item)
+    if not IsWorldFruit(item) then return end
+    local name = item.Name
+    LogChange("fruit_target", "fruit: collecting " .. name)
+    SetStatus("fruits | collecting " .. name)
+    local deadline = tick() + 55
+    local nextMove = 0
+    local attempts = 0
+    while tick() < deadline and IsWorldFruit(item) do
+        local character = LocalPlayer.Character
+        local playerRoot = character and character:FindFirstChild("HumanoidRootPart")
+        local pos, handle = FruitPosition(item)
+        if not playerRoot or not pos or not handle then break end
+        local distance = (playerRoot.Position - pos).Magnitude
+        if distance <= 10 then
+            -- Pickup fisico. Nao destrua o modelo e nao consuma/equipe a fruta.
+            pcall(function()
+                if firetouchinterest then
+                    firetouchinterest(playerRoot, handle, 0)
+                    firetouchinterest(playerRoot, handle, 1)
+                end
+            end)
+            task.wait(0.25)
+        elseif tick() >= nextMove then
+            local destination = pos + Vector3.new(0, 3, 0)
+            local motion = Tween(destination, 380)
+            attempts = attempts + 1
+            if not motion then break end
+            nextMove = tick() + math.clamp(distance / 380, 1, 4)
+        end
+        task.wait(0.12)
+    end
+    if not IsWorldFruit(item) then
+        LogChange("fruit_result", "fruit: disappeared from ground (check backpack/storage): " .. name)
+        CachedFruit = nil
+    else
+        FruitRetryAfter[item] = tick() + 50
+        CachedFruit = nil
+        warn("[Zyon] fruit: could not collect " .. name .. "; resuming other priorities, will retry")
+    end
+end
+
+local function FruitSpinDue()
+    if Config.AutoFruitSpin == false or tick() < FruitSpinNext then return false end
+    local level = LocalPlayer.Data.Level.Value
+    if level < 50 then return false end
+    local beli = LocalPlayer.Data.Beli.Value
+    local predictedPrice = 25000 + 150 * (level - 1)
+    local reserve = math.max(0, tonumber(Config.FruitSpinReserveBeli) or 250000)
+    if beli < predictedPrice + reserve then
+        FruitSpinNext = tick() + 180 -- reavaliar sem bloquear o farm
+        LogChange("fruit_spin_budget", string.format("fruit: gacha waiting for Beli (need %d + reserve %d)", predictedPrice, reserve))
+        return false
+    end
+    -- Nao girar se uma fruta fisica ainda estiver pendente na mochila.
+    -- AutoFruitStore tenta guarda-la; evita arriscar substituir/perder outra.
+    for _, container in ipairs({LocalPlayer.Backpack, LocalPlayer.Character}) do
+        if container then
+            for _, tool in ipairs(container:GetChildren()) do
+                if tool:IsA("Tool") and (tool.Name:find("Fruit", 1, true)
+                    or tostring(tool.ToolTip):lower() == "blox fruit") then
+                    FruitSpinNext = tick() + 90
+                    LogChange("fruit_spin_inventory", "fruit: gacha waiting for carried fruit to be stored")
+                    return false
+                end
+            end
+        end
+    end
+    return true
+end
+
+local function RollFruitOnce()
+    -- Blox Fruit Gacha / Zioles: Cousin Buy, cooldown ~2 horas.
+    -- DLCBoxData e consulta, NAO compra a fruta!
+    FruitSpinNext = tick() + 300 -- anti-duplicacao mesmo com resposta desconhecida
+    SetStatus("fruits | rolling at zioles")
+    LogChange("fruit_spin", "fruit: attempting Cousin/Buy (automatic roll)")
+    local previousMoney = LocalPlayer.Data.Beli.Value
+    local ok, response = pcall(function()
+        return CommF_:InvokeServer("Cousin", "Buy")
+    end)
+    if not ok then
+        warn("[Zyon] fruit: gacha purchase failed: " .. tostring(response))
+        return
+    end
+    task.wait(1.5)
+    local spent = math.max(0, previousMoney - LocalPlayer.Data.Beli.Value)
+    if spent > 0 then
+        FruitSpinNext = tick() + math.max(7200, tonumber(Config.FruitSpinInterval) or 7200)
+        LogChange("fruit_spin", string.format("fruit: gacha purchase confirmed (Beli spent: %d); next roll in >=2h", spent))
+        return
+    end
+    warn("[Zyon] fruit: gacha returned " .. tostring(response) .. " but payment not confirmed; retrying later")
+end
+
+local CASTLE_EVENT_POS = Vector3.new(-5000, 350, -3035)
+local FACTORY_EVENT_POS = Vector3.new(448, 199, -441)
+local EventAnnouncedUntil = {FACTORY = 0, CASTLE = 0}
+-- Os avisos de sistema permitem viajar ao evento mesmo antes dos NPCs
+-- serem carregados no streaming do cliente. A detecao de inimigos reais
+-- continua funcionando quando o chat do jogo nao emite esses avisos.
+local function HandleEventMessage(message)
+    if type(message) ~= "string" then return end
+    local msg = message:lower()
+    if msg:find("factory poison control activated", 1, true)
+        or msg:find("factory malfunction", 1, true) then
+        EventAnnouncedUntil.FACTORY = 0
+    elseif msg:find("factory has been breached", 1, true) then
+        EventAnnouncedUntil.FACTORY = tick() + 315
+        LogChange("event_notice", "raid event: factory started (system announcement)")
+    elseif msg:find("breaching the factory in 30 seconds", 1, true) then
+        EventAnnouncedUntil.FACTORY = tick() + 345
+        LogChange("event_notice", "raid event: factory preparing")
+    end
+    if msg:find("pirates have stopped raiding", 1, true)
+        or msg:find("good job! anybody", 1, true) then
+        EventAnnouncedUntil.CASTLE = 0
+    elseif msg:find("pirates are raiding castle", 1, true) then
+        EventAnnouncedUntil.CASTLE = tick() + 240
+        LogChange("event_notice", "raid event: castle pirate raid started")
+    elseif msg:find("pirates have been spotted approaching the castle", 1, true) then
+        EventAnnouncedUntil.CASTLE = tick() + 270
+        LogChange("event_notice", "raid event: pirates approaching castle")
+    end
+end
+pcall(function()
+    local TextChatService = game:GetService("TextChatService")
+    TextChatService.MessageReceived:Connect(function(message)
+        if message and message.Text then HandleEventMessage(message.Text) end
+    end)
+end)
+pcall(function()
+    local oldChat = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    local messageEvent = oldChat and oldChat:FindFirstChild("OnMessageDoneFiltering")
+    if messageEvent and messageEvent:IsA("RemoteEvent") then
+        messageEvent.OnClientEvent:Connect(function(message)
+            if type(message) == "table" and type(message.Message) == "string" then
+                HandleEventMessage(message.Message)
+            end
+        end)
+    end
+end)
+
+local function FindEventEnemy()
+    if Config.AutoEventRaids == false then return nil, nil end
+    if World.Sea2() then
+        local core = workspace.Enemies:FindFirstChild("Core")
+        local hum = core and core:FindFirstChildOfClass("Humanoid")
+        if core and hum and hum.Health > 0
+            and (core:FindFirstChild("HumanoidRootPart") or core.PrimaryPart) then
+            return "FACTORY", core
+        end
+    elseif World.Sea3() then
+        local best, bestDist = nil, math.huge
+        for _, enemy in ipairs(workspace.Enemies:GetChildren()) do
+            local hum = enemy:FindFirstChildOfClass("Humanoid")
+            local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+            local lvl = tonumber(enemy:GetAttribute("Level"))
+            local legacyRaider = enemy.Name:lower():find("pirate", 1, true)
+                or enemy.Name:lower():find("marine", 1, true)
+                or enemy.Name:lower():find("raider", 1, true)
+            if hum and hum.Health > 0 and root and ((lvl and lvl <= 1500) or (not lvl and legacyRaider))
+                and (root.Position - CASTLE_EVENT_POS).Magnitude <= 900 then
+                local distance = LocalPlayer:DistanceFromCharacter(root.Position)
+                if distance < bestDist then
+                    best, bestDist = enemy, distance
+                end
+            end
+        end
+        if best then return "CASTLE", best end
+    end
+    if World.Sea2() and tick() < EventAnnouncedUntil.FACTORY then
+        return "FACTORY", nil
+    end
+    if World.Sea3() and tick() < EventAnnouncedUntil.CASTLE then
+        return "CASTLE", nil
+    end
+    return nil, nil
+end
+
+local function FightEventEnemy(eventName)
+    local started = tick()
+    LogChange("event_active", "raid event: " .. string.lower(eventName) .. " detected")
+    while tick() - started < 45 do
+        local activeEvent, enemy = FindEventEnemy()
+        if activeEvent ~= eventName then break end
+        if not enemy then
+            -- O evento comecou, mas os NPCs podem nao estar carregados.
+            -- Aproximar do mapa do evento sem chamar requestEntrance ou raid chip.
+            local destination = eventName == "FACTORY" and FACTORY_EVENT_POS or CASTLE_EVENT_POS
+            SetStatus(eventName == "FACTORY" and "event | going to factory" or "event | going to castle")
+            if LocalPlayer:DistanceFromCharacter(destination) > 160 then
+                local motion = RunTween(destination + Vector3.new(0, 16, 0), nil, 350)
+                if not motion then break end
+                local deadline = tick() + 8
+                while tick() < deadline and motion.PlaybackState == Enum.PlaybackState.Playing do
+                    task.wait(0.2)
+                end
+            else
+                task.wait(1)
+            end
+            -- Prosseguir ate os inimigos darem spawn ou o prazo do aviso acabar.
+        else
+        local hum = enemy:FindFirstChildOfClass("Humanoid")
+        local root = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
+        if not hum or hum.Health <= 0 or not root or not root.Parent then break end
+        SetStatus((eventName == "FACTORY" and "event | factory core" or "event | castle pirate raid"))
+        local distance = LocalPlayer:DistanceFromCharacter(root.Position)
+        if distance > 28 then
+            local destination = root.Position + Vector3.new(0, 12, 4)
+            local moving = RunTween(destination, nil, 350) -- movimento direto, SEM requestEntrance
+            if not moving then break end
+            local deadline = tick() + math.clamp(distance / 350 + 1.5, 2, 14)
+            while tick() < deadline and hum.Parent and hum.Health > 0 do
+                if LocalPlayer:DistanceFromCharacter(root.Position) <= 29 then break end
+                if moving.PlaybackState == Enum.PlaybackState.Cancelled then break end
+                task.wait(0.18)
+            end
+        else
+            EquipWeapon()
+            local ok, err = pcall(Attack)
+            if not ok then warn("[Zyon] raid event attack: " .. tostring(err)) end
+            task.wait(0.15)
+        end
+        end -- enemy ~= nil
+    end
+end
+
+local function RunLevelPriorityStep()
+    -- Level farm e a UNICA atividade padrao na prioridade 3.
+    -- Desbloqueio dos Seas continua disponivel quando chega ao nivel requerido.
+    if not Config.EnableSideProgression then
+        local level = LocalPlayer.Data.Level.Value
+        if World.Sea1() and level >= 700 then
+            LogChange("main_mode", "mode: level / unlock sea 2")
+            UnlockSecondSea()
+        elseif World.Sea2() and level >= 1500 then
+            LogChange("main_mode", "mode: level / unlock sea 3")
+            UnlockThirdSea()
+        elseif level < MaxLevel then
+            LogChange("main_mode", "mode: farm level")
+            local ok, err = pcall(FarmLevelLogic)
+            if not ok then warn("[Zyon] farm: " .. tostring(err)) end
+        else
+            SetStatus("level | max level reached")
+            task.wait(2)
+        end
+    else
+        -- Opcional: estilo/espada/raca/etc, SEM ultrapassar fruta/evento.
+        RunLegacyProgressionStep()
+    end
+end
+
+local function StartPriorityWork(mode, target)
+    PriorityMode, PriorityTarget = mode, target
+    PriorityWorkerStarted = tick()
+    LogChange("priority_mode", "priority: " .. tostring(mode))
+    PriorityWorker = task.spawn(function()
+        local ok, err = pcall(function()
+            if mode == "FRUIT_PICKUP" then
+                CollectGroundFruit(target)
+            elseif mode == "FRUIT_ROLL" then
+                RollFruitOnce()
+            elseif mode == "EVENT_FACTORY" then
+                FightEventEnemy("FACTORY")
+            elseif mode == "EVENT_CASTLE" then
+                FightEventEnemy("CASTLE")
+            else
+                RunLevelPriorityStep()
+            end
+        end)
+        if not ok then
+            warn("[Zyon] priority " .. tostring(mode) .. ": " .. tostring(err))
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function ChoosePriority()
+    local fruit = FindGroundFruit()
+    if fruit then return "FRUIT_PICKUP", fruit end
+    if FruitSpinDue() then return "FRUIT_ROLL", nil end
+    local event, enemy = FindEventEnemy()
+    if event == "FACTORY" then return "EVENT_FACTORY", enemy end
+    if event == "CASTLE" then return "EVENT_CASTLE", enemy end
+    return "LEVEL", nil
+end
+
+-- Nao existem threads independentes de auto-farm/raid/frutas disputando Tween.
+-- A troca de prioridade cancela o worker ANTES de iniciar o proximo.
+task.spawn(function()
+    print("[Zyon] priorities ready: FRUIT > FACTORY/CASTLE EVENT > LEVEL")
+    print(string.format("[Zyon] fruits options: pickup=%s spin=%s store=%s roll>=7200s; event=%s normalRaids=%s sideProgression=%s",
+        tostring(Config.AutoFruitPickup), tostring(Config.AutoFruitSpin), tostring(Config.AutoFruitStore),
+        tostring(Config.AutoEventRaids), tostring(Config.AutoNormalRaids), tostring(Config.EnableSideProgression)))
+    while task.wait(0.25) do
+        if AutoRejoinActive or FindDisconnectPrompt() then
+            if PriorityWorker then
+                pcall(task.cancel, PriorityWorker)
+                PriorityWorker = nil
+                StopTween()
+                PriorityMode = nil
+            end
+            task.wait(1)
+        else
+            local success, newMode, newTarget = pcall(ChoosePriority)
+            if not success then
+                warn("[Zyon] priority scan failed: " .. tostring(newMode))
+                task.wait(1)
+            else
+                local finished = PriorityWorker == nil or coroutine.status(PriorityWorker) == "dead"
+                local changed = newMode ~= PriorityMode
+                    or (newMode == "FRUIT_PICKUP" and newTarget ~= PriorityTarget)
+                if changed or (finished and tick() - PriorityWorkerStarted >= 0.4) then
+                    if PriorityWorker and not finished then
+                        pcall(task.cancel, PriorityWorker)
+                    end
+                    if changed then
+                        StopTween()
+                        -- Se o trabalhador antigo foi cancelado no meio de
+                        -- Trevor/raid, ele nao executara seu cleanup normal.
+                        PAUSE_AUTO_STORE = false
+                    end
+                    PriorityWorker = nil
+                    StartPriorityWork(newMode, newTarget)
+                end
+            end
+        end
+    end
 end)
